@@ -1,0 +1,21 @@
+
+
+
+SSHKEY DEFINITIONS ::=
+BEGIN
+
+SshKeyCtx ::= SEQUENCE {
+	sk	[0] OCTET STRING  OPTIONAL	-- pk is unnec.
+						-- is_initiator is unnec.?
+}
+
+Msg ::= SEQUENCE {
+	pk	[0] OCTET STRING
+}
+
+InputToken ::= SEQUENCE {
+	ctx	[0] SshKeyCtx,
+	msg	[1] Msg
+}
+
+END
