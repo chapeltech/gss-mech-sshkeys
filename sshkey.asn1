@@ -1,21 +1,103 @@
-
-
-
 SSHKEY DEFINITIONS ::=
 BEGIN
 
 SshKeyCtx ::= SEQUENCE {
-	sk	[0] OCTET STRING  OPTIONAL	-- pk is unnec.
-						-- is_initiator is unnec.?
+	  user	[0] OCTET STRING	OPTIONAL
+	, key	[0] OCTET STRING	OPTIONAL
+	, h	[1] OCTET STRING	OPTIONAL	-- rolling hash ???
+	-- timestamp??
 }
 
-Msg ::= SEQUENCE {
-	pk	[0] OCTET STRING
+EncCtx ::= SEQUENCE {
+	  encPart	[0] OCTET STRING
 }
 
-InputToken ::= SEQUENCE {
-	ctx	[0] SshKeyCtx,
-	msg	[1] Msg
+--
+-- maybe we should take a hash of the request and previous request...
+-- that might defeat some sort of downgrade attack or something......
+
+--
+-- XXXrcd: TIMESTAMPS NEED TO BE IN SOME OF OUR PACKETS??!?
+
+SshKeyUserAuth ::= SEQUENCE {
+	  username	[0] OCTET STRING
+	, sig		[1] OCTET STRING	-- what are we signing?
+						-- username and session key?
+						-- Think about this one...
+						-- might need a hash or a nonce
+						-- of some things in the KEX.
 }
+
+EncSshKeyUserAuth ::= OCTET STRING
+
+SshKeyHostAuth ::= SEQUENCE {
+	  sigtype	[0] OCTET STRING
+	, sig		[1] OCTET STRING
+}
+
+--
+-- Either side can start the KEX.  It's not completely symmetrical, because
+-- only the server will sign its bit, because we don't want to reveal the
+-- username to Mallory.
+--
+-- For server signature, we may want 
+--
+-- Our KEX will leave us with a generated session key which will be used for
+-- any further tokens including userauth and gss_wrap/gss_unwrap, etc.
+--
+-- XXXrcd: to tie it all together, we should keep a rolling hash and actually
+--	   use said hash to generate the session key.  This will expose any
+--	   shenanigans Mallory might have been up to...
+
+SshKeyKEX ::= SEQUENCE {
+	-- Negotiation part
+	  kextypes	[0] OCTET STRING			-- curve25519 for now
+	, enctypes	[1] OCTET STRING			-- session keys
+	, sigtypes	[2] OCTET STRING			-- host keys
+
+	-- Proposal part
+	, kextype	[3] OCTET STRING	OPTIONAL
+	, pk		[4] OCTET STRING	OPTIONAL
+	, enctype	[5] OCTET STRING	OPTIONAL
+}
+
+--
+-- XXXrcd: errors need to be expanded to some degree.
+
+SshKeyStatus ::= INTEGER {
+	  SSH-KEY-COMPLETE		(1)
+	, SSH-KEY-CONTINUE-NEEDED	(2)
+	, SSH-KEY-FAILURE		(3)
+}
+
+SshKeyToken ::= SEQUENCE {
+	  status	[0] SshKeyStatus
+	, kex		[1] SshKeyKEX		OPTIONAL
+	, hostauth	[2] SshKeyHostAuth	OPTIONAL
+	, encuserauth	[3] EncSshKeyUserAuth	OPTIONAL
+	, cctx		[1] EncCtx		OPTIONAL
+	, sctx		[0] EncCtx		OPTIONAL
+}
+
+--
+-- XXXrcd: how about?
+--
+-- SshKeyMessage ::= SEQUENCE {
+--	  status	[0] SshKeyStatus
+--	, kex		[1] SshKeyKEX		OPTIONAL
+--	, hostauth	[2] SshKeyHostAuth	OPTIONAL
+--	, encuserauth	[3] EncSshKeyUserAuth	OPTIONAL
+-- }
+--
+-- SshKeyMessage ::= CHOICE {
+--	  plain		[0] SshKeyMessage
+--	, encPart	[1] OCTET STRING	-- just an encrypted plain
+-- }
+--
+-- SshKeyToken ::= SEQUENCE {
+--	  token		[0] SshKeyMessage
+--	, cctx		[1] EncCtx		OPTIONAL
+--	, sctx		[1] EncCtx		OPTIONAL
+-- }
 
 END
