@@ -91,7 +91,7 @@ SshKeyToken ::= SEQUENCE {
 --
 -- SshKeyMessage ::= CHOICE {
 --	  plain		[0] SshKeyMessage
---	, encPart	[1] OCTET STRING	-- just an encrypted plain
+--	, encPart	[1] OCTET STRING	// just an encrypted plain
 -- }
 --
 -- SshKeyToken ::= SEQUENCE {
