@@ -1,1 +1,10 @@
 *.so
+
+/asn1-template.h
+/asn1_sshkey.c
+/asn1_sshkey.x
+/sshkey-priv.h
+/sshkey-priv.hx
+/sshkey.h
+/sshkey.hx
+/sshkey_files
