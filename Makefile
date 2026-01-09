@@ -1,9 +1,10 @@
-CFLAGS  = -Wall -fPIC -I. -I/usr/include/heimdal  -I/var/tmp/openssh-install/include -I/u/elric/tree/libssh2/src 
+CFLAGS  = -Wall -g -fPIC -I. -I/usr/include/heimdal  -I/var/tmp/openssh-install/include -I/u/elric/tree/libssh2/src 
+CFLAGS += -Wno-unused-label
 LDFLAGS = -shared -L/var/tmp/openssh-install/lib 
 LDADD   = -Wl,-rpath=/var/tmp/openssh-install/lib -lssh2 -lcrypto
 TARGET  = sshkey.so
 
-SRCS=sshkey.c asn1_sshkey.c curve25519-donna.c
+SRCS=sshkey.c asn1_sshkey.c curve25519-donna.c cfx.c sequence.c
 
 all: $(TARGET)
 
@@ -22,3 +23,10 @@ $(TARGET): sshkey.c asn1_sshkey.c sshkey-priv.h sshkey.h
 
 clean:
 	rm -f $(TARGET)
+	rm -f asn1_sshkey.[cx]
+	rm -f asn1-template.h
+	rm -f sshkey-priv.h
+	rm -f sshkey-priv.hx
+	rm -f sshkey.hx
+	rm -f sshkey_files
+
