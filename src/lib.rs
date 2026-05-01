@@ -3,10 +3,12 @@
 
 use core::ffi::c_void;
 use core::ptr;
+use std::ffi::CString;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -14,9 +16,13 @@ use asn1::sshkey::{
     EncCtx, EncSshKeyUserAuth, SshKeyHostAuth, SshKeyKEX,
     SshKeyServerContext, SshKeyStatus, SshKeyToken, SshKeyUserAuth,
 };
+use hmac::{Hmac, Mac};
 use rasn::types::{Integer, OctetString};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use signature::{Signer, Verifier};
 use ssh_key::{
+    known_hosts::{HostPatterns, KnownHosts, Marker},
     Algorithm, PrivateKey, PublicKey, Signature as SshSignature,
 };
 
@@ -155,6 +161,18 @@ const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
 const SSH2_AGENT_FAILURE: u8 = 30;
 const SSH_AGENT_RSA_SHA2_256: u32 = 0x02;
 const SSH_AGENT_RSA_SHA2_512: u32 = 0x04;
+const SSHKEY_KNOWN_HOSTS_ENV: &str = "SSHKEY_KNOWN_HOSTS";
+const SSHKEY_HOST_ENV: &str = "SSHKEY_HOST";
+const DNS_CLASS_IN: c_int = 1;
+const DNS_TYPE_SSHFP: c_int = 44;
+const DNS_MAX_PACKET: usize = 65_535;
+const DNS_FLAG_AD: u16 = 0x0020;
+const SSHFP_KEY_RSA: u8 = 1;
+const SSHFP_KEY_DSA: u8 = 2;
+const SSHFP_KEY_ECDSA: u8 = 3;
+const SSHFP_KEY_ED25519: u8 = 4;
+const SSHFP_HASH_SHA1: u8 = 1;
+const SSHFP_HASH_SHA256: u8 = 2;
 
 #[link(name = "crypto")]
 unsafe extern "C" {
@@ -262,6 +280,17 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+#[link(name = "resolv")]
+unsafe extern "C" {
+    fn res_query(
+        dname: *const libc::c_char,
+        class: c_int,
+        type_: c_int,
+        answer: *mut c_uchar,
+        anslen: c_int,
+    ) -> c_int;
+}
+
 #[repr(C)]
 pub struct gss_OID_desc {
     length: OM_uint32,
@@ -312,6 +341,7 @@ struct SshKeyCtx {
     acceptor_sigtypes: Vec<u8>,
     server_context: Option<Vec<u8>>,
     display_name: Vec<u8>,
+    target_host: Option<String>,
     authenticated: bool,
     send_seq: u64,
     recv_seq: u64,
@@ -330,6 +360,7 @@ impl SshKeyCtx {
             acceptor_sigtypes: SIG_ALGS.to_vec(),
             server_context: None,
             display_name: b"sshkey".to_vec(),
+            target_host: None,
             authenticated: false,
             send_seq: 0,
             recv_seq: 0,
@@ -838,6 +869,356 @@ fn agent_sign(key: &[u8], data: &[u8], sigtype: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(signature)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostTrust {
+    Trusted,
+    Revoked,
+    NotFound,
+}
+
+fn normalize_host(host: &str) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let host = if let Some((_, host)) = host.rsplit_once('@') {
+        host
+    } else {
+        host
+    };
+    let host = host.trim().trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+unsafe fn target_host_from_name(name: gss_const_name_t) -> Option<String> {
+    if let Ok(host) = env::var(SSHKEY_HOST_ENV) {
+        if let Some(host) = normalize_host(&host) {
+            return Some(host);
+        }
+    }
+    if name.is_null() || (*name).value.is_null() {
+        return None;
+    }
+    let bytes = core::slice::from_raw_parts(
+        (*name).value.cast::<u8>(),
+        (*name).length as usize,
+    );
+    let value = core::str::from_utf8(bytes).ok()?;
+    normalize_host(value)
+}
+
+fn known_hosts_paths() -> Vec<PathBuf> {
+    if let Ok(paths) = env::var(SSHKEY_KNOWN_HOSTS_ENV) {
+        return paths
+            .split(':')
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect();
+    }
+
+    let mut paths = Vec::new();
+    if let Ok(home) = env::var("HOME") {
+        paths.push(PathBuf::from(format!("{home}/.ssh/known_hosts")));
+        paths.push(PathBuf::from(format!("{home}/.ssh/known_hosts2")));
+    }
+    paths.push(PathBuf::from("/etc/ssh/ssh_known_hosts"));
+    paths.push(PathBuf::from("/etc/ssh/ssh_known_hosts2"));
+    paths
+}
+
+fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return value.is_empty();
+    }
+    match pattern[0] {
+        b'*' => {
+            wildcard_match(&pattern[1..], value)
+                || (!value.is_empty() && wildcard_match(pattern, &value[1..]))
+        }
+        b'?' => !value.is_empty() && wildcard_match(&pattern[1..], &value[1..]),
+        byte => {
+            !value.is_empty()
+                && byte.eq_ignore_ascii_case(&value[0])
+                && wildcard_match(&pattern[1..], &value[1..])
+        }
+    }
+}
+
+fn known_host_plain_pattern_matches(pattern: &str, host: &str) -> bool {
+    let pattern = if pattern.starts_with('[') {
+        pattern
+            .find(']')
+            .map(|end| &pattern[1..end])
+            .unwrap_or(pattern)
+    } else {
+        pattern
+    };
+    wildcard_match(pattern.as_bytes(), host.as_bytes())
+}
+
+fn known_host_hash_matches(salt: &[u8], hash: &[u8; 20], host: &str) -> bool {
+    type HmacSha1 = Hmac<Sha1>;
+
+    let Ok(mut mac) = HmacSha1::new_from_slice(salt) else {
+        return false;
+    };
+    mac.update(host.as_bytes());
+    let actual = mac.finalize().into_bytes();
+    actual.as_slice() == hash
+}
+
+fn known_host_patterns_match(patterns: &HostPatterns, host: &str) -> bool {
+    match patterns {
+        HostPatterns::Patterns(patterns) => {
+            let mut matched = false;
+            for pattern in patterns {
+                if let Some(pattern) = pattern.strip_prefix('!') {
+                    if known_host_plain_pattern_matches(pattern, host) {
+                        return false;
+                    }
+                    continue;
+                }
+                matched |= known_host_plain_pattern_matches(pattern, host);
+            }
+            matched
+        }
+        HostPatterns::HashedName { salt, hash } => {
+            known_host_hash_matches(salt, hash, host)
+        }
+    }
+}
+
+fn known_hosts_trust_text(
+    host: &str,
+    key_blob: &[u8],
+    text: &str,
+) -> HostTrust {
+    let mut trusted = false;
+    for entry in KnownHosts::new(text).flatten() {
+        if !known_host_patterns_match(entry.host_patterns(), host) {
+            continue;
+        }
+        let Ok(entry_key) = entry.public_key().to_bytes() else {
+            continue;
+        };
+        if entry_key != key_blob {
+            continue;
+        }
+        if entry.marker() == Some(&Marker::Revoked) {
+            return HostTrust::Revoked;
+        }
+        if entry.marker().is_none() {
+            trusted = true;
+        }
+    }
+    if trusted {
+        HostTrust::Trusted
+    } else {
+        HostTrust::NotFound
+    }
+}
+
+fn known_hosts_trust(host: &str, key_blob: &[u8]) -> HostTrust {
+    let mut trusted = false;
+    for path in known_hosts_paths() {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        match known_hosts_trust_text(host, key_blob, &text) {
+            HostTrust::Trusted => trusted = true,
+            HostTrust::Revoked => return HostTrust::Revoked,
+            HostTrust::NotFound => {}
+        }
+    }
+    if trusted {
+        HostTrust::Trusted
+    } else {
+        HostTrust::NotFound
+    }
+}
+
+fn dns_read_u16(packet: &[u8], offset: &mut usize) -> Option<u16> {
+    if packet.len().checked_sub(*offset)? < 2 {
+        return None;
+    }
+    let value =
+        u16::from_be_bytes(packet[*offset..*offset + 2].try_into().ok()?);
+    *offset += 2;
+    Some(value)
+}
+
+fn dns_read_u32(packet: &[u8], offset: &mut usize) -> Option<u32> {
+    if packet.len().checked_sub(*offset)? < 4 {
+        return None;
+    }
+    let value =
+        u32::from_be_bytes(packet[*offset..*offset + 4].try_into().ok()?);
+    *offset += 4;
+    Some(value)
+}
+
+fn dns_skip_name(packet: &[u8], offset: &mut usize) -> Option<()> {
+    let mut jumps = 0usize;
+    loop {
+        let len = *packet.get(*offset)?;
+        if len & 0xc0 == 0xc0 {
+            if packet.len().checked_sub(*offset)? < 2 {
+                return None;
+            }
+            *offset += 2;
+            return Some(());
+        }
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        *offset += 1;
+        if len == 0 {
+            return Some(());
+        }
+        *offset = (*offset).checked_add(len as usize)?;
+        if *offset > packet.len() {
+            return None;
+        }
+        jumps += 1;
+        if jumps > 255 {
+            return None;
+        }
+    }
+}
+
+struct SshfpRecord {
+    algorithm: u8,
+    digest_type: u8,
+    digest: Vec<u8>,
+}
+
+fn parse_sshfp_response(packet: &[u8]) -> Option<Vec<SshfpRecord>> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let flags = u16::from_be_bytes(packet[2..4].try_into().ok()?);
+    if flags & DNS_FLAG_AD == 0 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes(packet[4..6].try_into().ok()?);
+    let ancount = u16::from_be_bytes(packet[6..8].try_into().ok()?);
+    let mut offset = 12usize;
+
+    for _ in 0..qdcount {
+        dns_skip_name(packet, &mut offset)?;
+        offset = offset.checked_add(4)?;
+        if offset > packet.len() {
+            return None;
+        }
+    }
+
+    let mut records = Vec::new();
+    for _ in 0..ancount {
+        dns_skip_name(packet, &mut offset)?;
+        let rr_type = dns_read_u16(packet, &mut offset)?;
+        let rr_class = dns_read_u16(packet, &mut offset)?;
+        let _ttl = dns_read_u32(packet, &mut offset)?;
+        let rdlen = dns_read_u16(packet, &mut offset)? as usize;
+        if packet.len().checked_sub(offset)? < rdlen {
+            return None;
+        }
+        let rdata = &packet[offset..offset + rdlen];
+        offset += rdlen;
+
+        if rr_type == DNS_TYPE_SSHFP as u16
+            && rr_class == DNS_CLASS_IN as u16
+            && rdata.len() >= 2
+        {
+            records.push(SshfpRecord {
+                algorithm: rdata[0],
+                digest_type: rdata[1],
+                digest: rdata[2..].to_vec(),
+            });
+        }
+    }
+
+    Some(records)
+}
+
+fn query_sshfp_records(host: &str) -> Option<Vec<SshfpRecord>> {
+    let name = CString::new(host).ok()?;
+    let mut answer = vec![0u8; DNS_MAX_PACKET];
+    let len = unsafe {
+        res_query(
+            name.as_ptr(),
+            DNS_CLASS_IN,
+            DNS_TYPE_SSHFP,
+            answer.as_mut_ptr(),
+            answer.len() as c_int,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    answer.truncate(len as usize);
+    parse_sshfp_response(&answer)
+}
+
+fn sshfp_algorithm(public_key: &PublicKey) -> Option<u8> {
+    match public_key.algorithm() {
+        Algorithm::Rsa { .. } => Some(SSHFP_KEY_RSA),
+        Algorithm::Dsa => Some(SSHFP_KEY_DSA),
+        Algorithm::Ecdsa { .. } => Some(SSHFP_KEY_ECDSA),
+        Algorithm::Ed25519 => Some(SSHFP_KEY_ED25519),
+        _ => None,
+    }
+}
+
+fn sshfp_record_matches(
+    record: &SshfpRecord,
+    algorithm: u8,
+    key_blob: &[u8],
+) -> bool {
+    if record.algorithm != algorithm {
+        return false;
+    }
+    match record.digest_type {
+        SSHFP_HASH_SHA1 => {
+            let digest = Sha1::digest(key_blob);
+            record.digest.as_slice() == digest.as_slice()
+        }
+        SSHFP_HASH_SHA256 => {
+            let digest = Sha256::digest(key_blob);
+            record.digest.as_slice() == digest.as_slice()
+        }
+        _ => false,
+    }
+}
+
+fn sshfp_trust(host: &str, public_key: &PublicKey, key_blob: &[u8]) -> bool {
+    let Some(algorithm) = sshfp_algorithm(public_key) else {
+        return false;
+    };
+    let Some(records) = query_sshfp_records(host) else {
+        return false;
+    };
+    records
+        .iter()
+        .any(|record| sshfp_record_matches(record, algorithm, key_blob))
+}
+
+fn host_key_is_trusted(host: &str, key_blob: &[u8]) -> bool {
+    let Some(host) = normalize_host(host) else {
+        return false;
+    };
+    let Ok(public_key) = PublicKey::from_bytes(key_blob) else {
+        return false;
+    };
+    match known_hosts_trust(&host, key_blob) {
+        HostTrust::Trusted => true,
+        HostTrust::Revoked => false,
+        HostTrust::NotFound => sshfp_trust(&host, &public_key, key_blob),
+    }
 }
 
 fn alg_list_contains(list: &[u8], alg: &[u8]) -> bool {
@@ -2518,10 +2899,14 @@ pub unsafe extern "C" fn gss_init_sec_context(
     }
 
     if (*context).is_null() {
-        let ctx = Box::new(SshKeyCtx::new(true));
+        let mut ctx = Box::new(SshKeyCtx::new(true));
+        ctx.target_host = target_host_from_name(_target_name);
         *context = Box::into_raw(ctx).cast();
     }
     let ctx = &mut *((*context).cast::<SshKeyCtx>());
+    if ctx.target_host.is_none() {
+        ctx.target_host = target_host_from_name(_target_name);
+    }
 
     if !_input_token.is_null() && (*_input_token).length != 0 {
         let token = match decode_context_token(minor, _input_token) {
@@ -2608,6 +2993,14 @@ pub unsafe extern "C" fn gss_init_sec_context(
                 hostauth.sig.as_ref(),
                 &input,
             ) {
+                set_minor(minor, EINVAL);
+                return GSS_S_BAD_SIG;
+            }
+            let Some(host) = ctx.target_host.as_deref() else {
+                set_minor(minor, EINVAL);
+                return GSS_S_BAD_NAME;
+            };
+            if !host_key_is_trusted(host, hostauth.key.as_ref()) {
                 set_minor(minor, EINVAL);
                 return GSS_S_BAD_SIG;
             }
@@ -3842,6 +4235,92 @@ mod tests {
         assert_eq!(agent_signature_flags(b"rsa-sha2-256"), 0x02);
         assert_eq!(agent_signature_flags(b"rsa-sha2-512"), 0x04);
         assert_eq!(agent_signature_flags(b"ssh-ed25519"), 0);
+    }
+
+    #[test]
+    fn known_hosts_text_trusts_and_revokes_keys() {
+        let private_key = ed25519_private_key();
+        let public_key = private_key.public_key();
+        let key = public_key.to_bytes().unwrap();
+        let trusted = format!("example.com {}", public_key.to_string());
+        let revoked =
+            format!("@revoked example.com {}", public_key.to_string());
+
+        assert_eq!(
+            known_hosts_trust_text("example.com", &key, &trusted),
+            HostTrust::Trusted
+        );
+        assert_eq!(
+            known_hosts_trust_text("example.com", &key, &revoked),
+            HostTrust::Revoked
+        );
+        assert_eq!(
+            known_hosts_trust_text("other.example", &key, &trusted),
+            HostTrust::NotFound
+        );
+    }
+
+    #[test]
+    fn hashed_known_host_patterns_match_hmac_sha1() {
+        type HmacSha1 = Hmac<Sha1>;
+
+        let salt = b"salt";
+        let mut mac = HmacSha1::new_from_slice(salt).unwrap();
+        mac.update(b"example.com");
+        let hash: [u8; 20] = mac.finalize().into_bytes().into();
+        let patterns = HostPatterns::HashedName {
+            salt: salt.to_vec(),
+            hash,
+        };
+
+        assert!(known_host_patterns_match(&patterns, "example.com"));
+        assert!(!known_host_patterns_match(&patterns, "other.example"));
+    }
+
+    fn sshfp_packet(host: &str, algorithm: u8, digest: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&0x1234u16.to_be_bytes());
+        packet.extend_from_slice(&0x8020u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        for label in host.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
+        packet.extend_from_slice(&(DNS_TYPE_SSHFP as u16).to_be_bytes());
+        packet.extend_from_slice(&(DNS_CLASS_IN as u16).to_be_bytes());
+        packet.extend_from_slice(&[0xc0, 0x0c]);
+        packet.extend_from_slice(&(DNS_TYPE_SSHFP as u16).to_be_bytes());
+        packet.extend_from_slice(&(DNS_CLASS_IN as u16).to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&((digest.len() + 2) as u16).to_be_bytes());
+        packet.push(algorithm);
+        packet.push(SSHFP_HASH_SHA256);
+        packet.extend_from_slice(digest);
+        packet
+    }
+
+    #[test]
+    fn sshfp_parser_requires_ad_and_matches_digest() {
+        let private_key = ed25519_private_key();
+        let key = private_key.public_key().to_bytes().unwrap();
+        let digest = Sha256::digest(&key);
+        let packet = sshfp_packet("example.com", SSHFP_KEY_ED25519, &digest);
+        let records = parse_sshfp_response(&packet).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert!(sshfp_record_matches(
+            &records[0],
+            SSHFP_KEY_ED25519,
+            &key
+        ));
+
+        let mut insecure = packet;
+        insecure[3] &= !DNS_FLAG_AD as u8;
+        assert!(parse_sshfp_response(&insecure).is_none());
     }
 
     #[test]

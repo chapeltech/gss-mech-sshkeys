@@ -33,6 +33,8 @@ Implemented so far:
 - SSH signature blob encode, decode, sign, and verify helpers.
 - Acceptor host-key signatures from OpenSSH private keys.
 - Initiator user-key signatures through `ssh-agent`.
+- Client host-key trust through OpenSSH `known_hosts` files and
+  DNSSEC-validated SSHFP records.
 - Encrypted stateless acceptor context returned through `sctx`.
 - Client-first and acceptor-first context establishment.
 - RFC 4121-style per-message wrapping with `gss_wrap`,
@@ -41,8 +43,6 @@ Implemented so far:
 
 Not complete yet:
 
-- Client host key trust policy through `known_hosts` and DNSSEC-validated
-  SSHFP records.
 - `authorized_keys` lookup and authorization.
 - Finished MAC key confirmation from the current draft.
 - Production OID assignment and packaged installation.
@@ -107,6 +107,11 @@ generally cannot interactively ask the user for SSH key passphrases.
 
 - `SSHKEY_HOST_KEY`: OpenSSH private key used by the acceptor to sign its ECDH
   reply.
+- `SSHKEY_KNOWN_HOSTS`: optional colon-separated list of known-hosts files for
+  initiator host-key trust.  Defaults to the user's OpenSSH files and
+  `/etc/ssh/ssh_known_hosts`.
+- `SSHKEY_HOST`: optional host-name override for tests.  Normal operation uses
+  the host component of the GSS target name.
 - `SSHKEY_USER`: authorization name signed by the initiator.  Defaults to
   `USER`, then `sshkey`.
 - `SSHKEY_CTX_KEY`: 32-byte hex key used to encrypt acceptor continuation

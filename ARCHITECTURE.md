@@ -38,6 +38,8 @@ normal buffers and IOV buffers share per-message protection behavior.
 Prototype credential and state configuration is environment-variable based:
 
 - `SSHKEY_HOST_KEY`: OpenSSH private key used for acceptor host signatures.
+- `SSHKEY_KNOWN_HOSTS`: optional colon-separated known-hosts file list.
+- `SSHKEY_HOST`: optional target host override for tests.
 - `SSHKEY_USER`: requested authorization identity.
 - `SSHKEY_CTX_KEY`: 32-byte hex key for encrypted acceptor continuation state.
 - `SSH_AUTH_SOCK`: OpenSSH agent socket used for initiator user signatures.
@@ -51,7 +53,6 @@ cannot finish the same authentication.
 Host signatures and user signatures are cryptographically verified, but policy
 is not complete:
 
-- host key trust is not checked against `known_hosts` or SSHFP;
 - user keys are not checked against `authorized_keys`;
 - the draft's Finished MAC key confirmation is not implemented;
 - user signature retry negotiation is only partially wired.
