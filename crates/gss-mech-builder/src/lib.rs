@@ -177,6 +177,33 @@ pub fn unprotect_message<C: Rfc4121Context>(
     Ok((result.plaintext, result.sealed))
 }
 
+pub fn get_mic_message<C: Rfc4121Context>(
+    ctx: &mut C,
+    message: &[u8],
+) -> Result<Vec<u8>, Status> {
+    let profile = ctx.profile()?;
+    let mut state =
+        rfc4121::TokenState::new(ctx.role(), ctx.send_seq(), ctx.recv_seq());
+    let result = state.checksum(&profile, message).map_err(rfc4121_status)?;
+    ctx.set_send_seq(state.send_seq());
+    Ok(result.token)
+}
+
+pub fn verify_mic_message<C: Rfc4121Context>(
+    ctx: &mut C,
+    message: &[u8],
+    token: &[u8],
+) -> Result<(), Status> {
+    let profile = ctx.profile()?;
+    let mut state =
+        rfc4121::TokenState::new(ctx.role(), ctx.send_seq(), ctx.recv_seq());
+    state
+        .verify_checksum(&profile, message, token)
+        .map_err(rfc4121_status)?;
+    ctx.set_recv_seq(state.recv_seq());
+    Ok(())
+}
+
 pub unsafe fn set_minor(minor: *mut OM_uint32, value: OM_uint32) {
     if !minor.is_null() {
         *minor = value;
@@ -216,6 +243,20 @@ pub unsafe fn set_buffer_bytes(
     (*buf).value = value;
     set_minor(minor, 0);
     GSS_S_COMPLETE
+}
+
+unsafe fn buffer_slice<'a>(buf: gss_buffer_t) -> Result<&'a [u8], Status> {
+    if buf.is_null() {
+        return Err(Status::new(GSS_S_FAILURE, EINVAL));
+    }
+    if (*buf).length != 0 && (*buf).value.is_null() {
+        return Err(Status::new(GSS_S_FAILURE, EINVAL));
+    }
+
+    Ok(core::slice::from_raw_parts(
+        (*buf).value.cast::<u8>(),
+        (*buf).length,
+    ))
 }
 
 pub unsafe fn release_buffer(buf: gss_buffer_t) {
@@ -446,14 +487,11 @@ pub unsafe fn set_iov_lengths<C: Rfc4121Context>(
     seal: bool,
 ) -> Result<(), Status> {
     let data_len = iov_type_len(iovs, GSS_IOV_BUFFER_TYPE_DATA)?;
-    let trailer_len = trailer_len::<C>(seal);
+    let plan = rfc4121::buffer_plan::<C::Profile>(data_len, seal)
+        .map_err(rfc4121_status)?;
 
     if let Some(stream) = find_iov(iovs, GSS_IOV_BUFFER_TYPE_STREAM) {
-        let len = rfc4121::HEADER_LEN
-            .checked_add(data_len)
-            .and_then(|len| len.checked_add(trailer_len))
-            .ok_or(Status::new(GSS_S_FAILURE, EINVAL))?;
-        set_iov_length(&mut iovs[stream], len)?;
+        set_iov_length(&mut iovs[stream], plan.stream_len)?;
         return Ok(());
     }
 
@@ -462,8 +500,8 @@ pub unsafe fn set_iov_lengths<C: Rfc4121Context>(
     let trailer = find_iov(iovs, GSS_IOV_BUFFER_TYPE_TRAILER)
         .ok_or(Status::new(GSS_S_FAILURE, EINVAL))?;
 
-    set_iov_length(&mut iovs[header], rfc4121::HEADER_LEN)?;
-    set_iov_length(&mut iovs[trailer], trailer_len)?;
+    set_iov_length(&mut iovs[header], plan.header_len)?;
+    set_iov_length(&mut iovs[trailer], plan.trailer_len)?;
     for iov in iovs {
         if iov_buffer_type(iov.type_) == GSS_IOV_BUFFER_TYPE_PADDING {
             set_iov_length(iov, 0)?;
@@ -481,8 +519,9 @@ pub unsafe fn protect_iov_message<C: Rfc4121Context>(
     let plaintext = collect_iovs_by_type(iovs, GSS_IOV_BUFFER_TYPE_DATA)?;
     let aad = collect_iovs_by_type(iovs, GSS_IOV_BUFFER_TYPE_SIGN_ONLY)?;
     let (token, sealed) = protect_message(ctx, seal, &plaintext, &aad)?;
-    let trailer_len = trailer_len::<C>(sealed);
-    if token.len() != rfc4121::HEADER_LEN + plaintext.len() + trailer_len {
+    let plan = rfc4121::buffer_plan::<C::Profile>(plaintext.len(), sealed)
+        .map_err(rfc4121_status)?;
+    if token.len() != plan.stream_len {
         return Err(Status::new(GSS_S_FAILURE, EINVAL));
     }
 
@@ -500,10 +539,10 @@ pub unsafe fn protect_iov_message<C: Rfc4121Context>(
         .ok_or(Status::new(GSS_S_FAILURE, EINVAL))?;
     let trailer = find_iov(iovs, GSS_IOV_BUFFER_TYPE_TRAILER)
         .ok_or(Status::new(GSS_S_FAILURE, EINVAL))?;
-    let body_end = rfc4121::HEADER_LEN + plaintext.len();
+    let body_end = plan.header_len + plaintext.len();
 
-    set_iov_bytes(&mut iovs[header], &token[..rfc4121::HEADER_LEN])?;
-    copy_data_to_iovs(iovs, &token[rfc4121::HEADER_LEN..body_end])?;
+    set_iov_bytes(&mut iovs[header], &token[..plan.header_len])?;
+    copy_data_to_iovs(iovs, &token[plan.header_len..body_end])?;
     set_iov_bytes(&mut iovs[trailer], &token[body_end..])?;
     for iov in iovs {
         if iov_buffer_type(iov.type_) == GSS_IOV_BUFFER_TYPE_PADDING {
@@ -572,6 +611,81 @@ pub unsafe fn wrap_size_limit<C: Rfc4121Context>(
     GSS_S_COMPLETE
 }
 
+pub unsafe fn get_mic<C: Rfc4121Context>(
+    minor: *mut OM_uint32,
+    ctx: gss_const_ctx_id_t,
+    _qop_req: gss_qop_t,
+    message: gss_buffer_t,
+    token: gss_buffer_t,
+) -> OM_uint32 {
+    clear_buffer(token);
+    if ctx.is_null() {
+        set_minor(minor, EINVAL);
+        return GSS_S_NO_CONTEXT;
+    }
+    if token.is_null() {
+        set_minor(minor, EINVAL);
+        return GSS_S_FAILURE;
+    }
+
+    let message = match buffer_slice(message) {
+        Ok(message) => message,
+        Err(status) => {
+            set_minor(minor, status.minor);
+            return status.major;
+        }
+    };
+    let ctx = &mut *(ctx.cast_mut().cast::<C>());
+    let mic = match get_mic_message(ctx, message) {
+        Ok(mic) => mic,
+        Err(status) => {
+            set_minor(minor, status.minor);
+            return status.major;
+        }
+    };
+
+    set_buffer_bytes(minor, token, &mic)
+}
+
+pub unsafe fn verify_mic<C: Rfc4121Context>(
+    minor: *mut OM_uint32,
+    ctx: gss_const_ctx_id_t,
+    message: gss_buffer_t,
+    token: gss_buffer_t,
+    qop_state: *mut gss_qop_t,
+) -> OM_uint32 {
+    if !qop_state.is_null() {
+        *qop_state = 0;
+    }
+    if ctx.is_null() {
+        set_minor(minor, EINVAL);
+        return GSS_S_NO_CONTEXT;
+    }
+
+    let message = match buffer_slice(message) {
+        Ok(message) => message,
+        Err(status) => {
+            set_minor(minor, status.minor);
+            return status.major;
+        }
+    };
+    let token = match buffer_slice(token) {
+        Ok(token) => token,
+        Err(status) => {
+            set_minor(minor, status.minor);
+            return status.major;
+        }
+    };
+    let ctx = &mut *(ctx.cast_mut().cast::<C>());
+    if let Err(status) = verify_mic_message(ctx, message, token) {
+        set_minor(minor, status.minor);
+        return status.major;
+    }
+
+    set_minor(minor, 0);
+    GSS_S_COMPLETE
+}
+
 pub unsafe fn wrap<C: Rfc4121Context>(
     minor: *mut OM_uint32,
     ctx: gss_const_ctx_id_t,
@@ -593,16 +707,14 @@ pub unsafe fn wrap<C: Rfc4121Context>(
         set_minor(minor, EINVAL);
         return GSS_S_FAILURE;
     }
-    if (*input).length != 0 && (*input).value.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_FAILURE;
-    }
 
-    let mut data = core::slice::from_raw_parts(
-        (*input).value.cast::<u8>(),
-        (*input).length,
-    )
-    .to_vec();
+    let mut data = match buffer_slice(input) {
+        Ok(input) => input.to_vec(),
+        Err(status) => {
+            set_minor(minor, status.minor);
+            return status.major;
+        }
+    };
     let mut iovs = [
         gss_iov_buffer_desc {
             type_: GSS_IOV_BUFFER_TYPE_HEADER | GSS_IOV_BUFFER_FLAG_ALLOCATE,
@@ -682,9 +794,9 @@ pub unsafe fn unwrap<C: Rfc4121Context>(
         set_minor(minor, EINVAL);
         return GSS_S_FAILURE;
     }
-    if (*input).length != 0 && (*input).value.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_FAILURE;
+    if let Err(status) = buffer_slice(input) {
+        set_minor(minor, status.minor);
+        return status.major;
     }
 
     let mut iovs = [
@@ -901,6 +1013,28 @@ macro_rules! export_rfc4121_per_message {
                 req_output_size,
                 max_input_size,
             )
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn gss_get_mic(
+            minor: *mut $crate::sys::OM_uint32,
+            ctx: $crate::sys::gss_const_ctx_id_t,
+            qop_req: $crate::sys::gss_qop_t,
+            message: $crate::sys::gss_buffer_t,
+            token: $crate::sys::gss_buffer_t,
+        ) -> $crate::sys::OM_uint32 {
+            $crate::get_mic::<$ctx>(minor, ctx, qop_req, message, token)
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn gss_verify_mic(
+            minor: *mut $crate::sys::OM_uint32,
+            ctx: $crate::sys::gss_const_ctx_id_t,
+            message: $crate::sys::gss_buffer_t,
+            token: $crate::sys::gss_buffer_t,
+            qop_state: *mut $crate::sys::gss_qop_t,
+        ) -> $crate::sys::OM_uint32 {
+            $crate::verify_mic::<$ctx>(minor, ctx, message, token, qop_state)
         }
 
         #[no_mangle]
@@ -1157,6 +1291,21 @@ mod tests {
         assert!(sealed);
         assert_eq!(message, b"hello");
         assert_eq!(acceptor.recv_seq, 1);
+    }
+
+    #[test]
+    fn mic_helpers_update_sequences() {
+        let mut initiator = TestContext::new(rfc4121::Role::Initiator);
+        let mut acceptor = TestContext::new(rfc4121::Role::Acceptor);
+
+        let token = get_mic_message(&mut initiator, b"hello").unwrap();
+        assert_eq!(initiator.send_seq, 1);
+        verify_mic_message(&mut acceptor, b"hello", &token).unwrap();
+        assert_eq!(acceptor.recv_seq, 1);
+        assert_eq!(
+            verify_mic_message(&mut acceptor, b"hello", &token).unwrap_err(),
+            rfc4121_status(rfc4121::Error::Sequence),
+        );
     }
 
     #[test]

@@ -85,6 +85,7 @@ const SANON_SESSION_KEY_LEN: usize = 16;
 const X25519_PUBLIC_LEN: usize = 32;
 const X25519_SHARED_LEN: usize = 32;
 const CONTEXT_KEY_LEN: usize = 32;
+#[cfg(test)]
 const CFX_HEADER_LEN: usize = rfc4121::HEADER_LEN;
 const CFX_HMAC_LEN: usize = 32;
 const CFX_GCM_TAG_LEN: usize = 16;
@@ -1556,37 +1557,6 @@ unsafe fn sp800_108_hmac_sha256<const N: usize>(
     Some(out)
 }
 
-unsafe fn derive_cfx_key(
-    session_key: &[u8; SANON_SESSION_KEY_LEN],
-    sender_acceptor: bool,
-    seal: bool,
-) -> Option<[u8; CFX_HMAC_LEN]> {
-    let label = match (sender_acceptor, seal) {
-        (true, true) => b"RFC4121 KG-USAGE-ACCEPTOR-SEAL 22".as_slice(),
-        (true, false) => b"RFC4121 KG-USAGE-ACCEPTOR-SIGN 23".as_slice(),
-        (false, true) => b"RFC4121 KG-USAGE-INITIATOR-SEAL 24".as_slice(),
-        (false, false) => b"RFC4121 KG-USAGE-INITIATOR-SIGN 25".as_slice(),
-    };
-
-    hmac_sha256(session_key, label)
-}
-
-unsafe fn derive_cfx_nonce(
-    key: &[u8; CFX_HMAC_LEN],
-    sender_acceptor: bool,
-    seq: u64,
-) -> Option<[u8; CFX_GCM_NONCE_LEN]> {
-    let mut data = Vec::with_capacity(32);
-    data.extend_from_slice(b"RFC4121 AES-256-GCM nonce");
-    data.push(u8::from(sender_acceptor));
-    data.extend_from_slice(&seq.to_be_bytes());
-
-    let digest = hmac_sha256(key, &data)?;
-    let mut nonce = [0u8; CFX_GCM_NONCE_LEN];
-    nonce.copy_from_slice(&digest[..CFX_GCM_NONCE_LEN]);
-    Some(nonce)
-}
-
 unsafe fn aes_256_gcm_encrypt(
     key: &[u8; CFX_HMAC_LEN],
     nonce: &[u8; CFX_GCM_NONCE_LEN],
@@ -1752,92 +1722,7 @@ unsafe fn cfx_wrap_message(
     cfx_wrap_message_with_aad(ctx, conf_req, plaintext, &[])
 }
 
-struct SshKeyRfc4121Profile {
-    session_key: [u8; SANON_SESSION_KEY_LEN],
-}
-
-impl rfc4121::CryptoProfile for SshKeyRfc4121Profile {
-    const CHECKSUM_LEN: usize = CFX_HMAC_LEN;
-    const SEALED_OVERHEAD: usize = CFX_GCM_TAG_LEN;
-
-    fn seal(
-        &self,
-        sender: rfc4121::Role,
-        seq: u64,
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, rfc4121::Error> {
-        unsafe {
-            let sender_acceptor = sender.is_acceptor();
-            let key = derive_cfx_key(&self.session_key, sender_acceptor, true)
-                .ok_or(rfc4121::Error::Failure)?;
-            let nonce = derive_cfx_nonce(&key, sender_acceptor, seq)
-                .ok_or(rfc4121::Error::Failure)?;
-            aes_256_gcm_encrypt(&key, &nonce, aad, plaintext)
-                .ok_or(rfc4121::Error::Failure)
-        }
-    }
-
-    fn open(
-        &self,
-        sender: rfc4121::Role,
-        seq: u64,
-        aad: &[u8],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, rfc4121::Error> {
-        unsafe {
-            let sender_acceptor = sender.is_acceptor();
-            let key = derive_cfx_key(&self.session_key, sender_acceptor, true)
-                .ok_or(rfc4121::Error::Failure)?;
-            let nonce = derive_cfx_nonce(&key, sender_acceptor, seq)
-                .ok_or(rfc4121::Error::Failure)?;
-            aes_256_gcm_decrypt(&key, &nonce, aad, ciphertext)
-                .ok_or(rfc4121::Error::BadSignature)
-        }
-    }
-
-    fn sign(
-        &self,
-        sender: rfc4121::Role,
-        _seq: u64,
-        aad: &[u8],
-        plaintext: &[u8],
-        checksum_header: &[u8; CFX_HEADER_LEN],
-    ) -> Result<Vec<u8>, rfc4121::Error> {
-        unsafe {
-            let key =
-                derive_cfx_key(&self.session_key, sender.is_acceptor(), false)
-                    .ok_or(rfc4121::Error::Failure)?;
-            let mut signed = Vec::with_capacity(
-                aad.len() + plaintext.len() + CFX_HEADER_LEN,
-            );
-            signed.extend_from_slice(aad);
-            signed.extend_from_slice(plaintext);
-            signed.extend_from_slice(checksum_header);
-            hmac_sha256(&key, &signed)
-                .map(Vec::from)
-                .ok_or(rfc4121::Error::Failure)
-        }
-    }
-
-    fn verify(
-        &self,
-        sender: rfc4121::Role,
-        seq: u64,
-        aad: &[u8],
-        plaintext: &[u8],
-        checksum_header: &[u8; CFX_HEADER_LEN],
-        checksum: &[u8],
-    ) -> Result<(), rfc4121::Error> {
-        let expected =
-            self.sign(sender, seq, aad, plaintext, checksum_header)?;
-        if rfc4121::constant_time_eq(checksum, &expected) {
-            Ok(())
-        } else {
-            Err(rfc4121::Error::BadSignature)
-        }
-    }
-}
+type SshKeyRfc4121Profile = rfc4121::Aes256GcmSha256Profile;
 
 impl Rfc4121Context for SshKeyCtx {
     type Profile = SshKeyRfc4121Profile;
@@ -1869,7 +1754,7 @@ impl Rfc4121Context for SshKeyCtx {
         let Some(session_key) = self.session_key else {
             return Err(Status::new(GSS_S_NO_CONTEXT, EINVAL));
         };
-        Ok(SshKeyRfc4121Profile { session_key })
+        Ok(SshKeyRfc4121Profile::new(session_key))
     }
 }
 
@@ -3220,29 +3105,25 @@ pub unsafe extern "C" fn gss_context_time(
 #[no_mangle]
 pub unsafe extern "C" fn gss_get_mic(
     minor: *mut OM_uint32,
-    _ctx: gss_const_ctx_id_t,
-    _qop_req: gss_qop_t,
-    _message: gss_buffer_t,
+    ctx: gss_const_ctx_id_t,
+    qop_req: gss_qop_t,
+    message: gss_buffer_t,
     token: gss_buffer_t,
 ) -> OM_uint32 {
-    clear_buffer(token);
-    set_minor(minor, ENOTSUP);
-    GSS_S_UNAVAILABLE
+    gss_mech_builder::get_mic::<SshKeyCtx>(minor, ctx, qop_req, message, token)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn gss_verify_mic(
     minor: *mut OM_uint32,
-    _ctx: gss_const_ctx_id_t,
-    _message: gss_buffer_t,
-    _token: gss_buffer_t,
+    ctx: gss_const_ctx_id_t,
+    message: gss_buffer_t,
+    token: gss_buffer_t,
     qop_state: *mut gss_qop_t,
 ) -> OM_uint32 {
-    if !qop_state.is_null() {
-        *qop_state = 0;
-    }
-    set_minor(minor, ENOTSUP);
-    GSS_S_UNAVAILABLE
+    gss_mech_builder::verify_mic::<SshKeyCtx>(
+        minor, ctx, message, token, qop_state,
+    )
 }
 
 #[no_mangle]
@@ -3858,6 +3739,67 @@ mod tests {
                 cfx_unwrap_message(&mut acceptor, &token).unwrap_err(),
                 GSS_S_BAD_SIG
             );
+        }
+    }
+
+    #[test]
+    fn cfx_mic_round_trips_and_rejects_replay() {
+        unsafe {
+            let (mut initiator, mut acceptor) = cfx_test_contexts();
+            let message_bytes = b"mic message";
+            let mut message = gss_buffer_desc {
+                length: message_bytes.len(),
+                value: message_bytes.as_ptr() as *mut c_void,
+            };
+            let mut token = gss_buffer_desc {
+                length: 0,
+                value: ptr::null_mut(),
+            };
+            let mut minor = 0;
+            let mut qop_state = 99;
+
+            assert_eq!(
+                gss_get_mic(
+                    &mut minor,
+                    (&mut initiator as *mut SshKeyCtx).cast(),
+                    0,
+                    &mut message,
+                    &mut token,
+                ),
+                GSS_S_COMPLETE
+            );
+            assert_eq!(initiator.send_seq, 1);
+            assert_eq!(
+                core::slice::from_raw_parts(
+                    token.value.cast::<u8>(),
+                    token.length,
+                )[..2],
+                rfc4121::CHECKSUM_TOKEN_ID,
+            );
+            assert_eq!(
+                gss_verify_mic(
+                    &mut minor,
+                    (&mut acceptor as *mut SshKeyCtx).cast(),
+                    &mut message,
+                    &mut token,
+                    &mut qop_state,
+                ),
+                GSS_S_COMPLETE
+            );
+            assert_eq!(qop_state, 0);
+            assert_eq!(acceptor.recv_seq, 1);
+            assert_eq!(
+                gss_verify_mic(
+                    &mut minor,
+                    (&mut acceptor as *mut SshKeyCtx).cast(),
+                    &mut message,
+                    &mut token,
+                    &mut qop_state,
+                ),
+                GSS_S_UNSEQ_TOKEN
+            );
+
+            libc::free(token.value);
         }
     }
 

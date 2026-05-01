@@ -24,16 +24,13 @@ publication.  Any protocol-affecting implementation change must update both.
 - Integrate `gss-mech-builder` for per-message services.  The ssh-key
   mechanism now implements the builder's RFC4121 context trait and delegates
   `gss_wrap()`, `gss_unwrap()`, and IOV entrypoints to the builder.
+- Finish the first reusable `rfc4121` crate slice.  The crate now owns wrap
+  and MIC token framing, split-token size planning, and the
+  `aes256-gcm-sha256` profile used by this mechanism.
 
 ## Next Steps
 
-1. Finish the `rfc4121` crate.
-
-   Add checksum/MIC tokens, IOV-style buffer planning, and a real
-   aes256-gcm-sha256 profile while keeping API names protocol-neutral.  Do not
-   add legacy DES, Triple-DES, RC4, or other old enctypes.
-
-2. Finish and integrate `gss-mech-builder`.
+1. Finish and integrate `gss-mech-builder`.
 
    Build it as layered API surfaces:
 
@@ -54,41 +51,36 @@ publication.  Any protocol-affecting implementation change must update both.
    Add the remaining common exports, then add the higher-level signed-ECDH API
    under a separate module so simpler mechanisms can keep using lower layers.
 
-3. Add `authorized_keys` authorization.
+2. Add `authorized_keys` authorization.
 
    The acceptor currently verifies that the user signature matches the supplied
    public key, but it does not check whether that key is authorized for the
    requested user.  Start with local `authorized_keys` compatibility.
 
-4. Finish user signature retry negotiation.
+3. Finish user signature retry negotiation.
 
    The acceptor can return a narrower signature algorithm list, but the
    initiator does not yet retry with a different acceptable signature algorithm.
    This matters most for old RSA keys and legacy `ssh-rsa`.
 
-5. Replace remaining OpenSSL FFI where practical.
+4. Replace remaining OpenSSL FFI where practical.
 
    X25519, HMAC-SHA256, and AES-256-GCM still use direct OpenSSL FFI.  Evaluate
    RustCrypto crates or idiomatic bindings while preserving interoperability
    and avoiding private Heimdal APIs.
 
-6. Implement missing GSS services.
-
-   `gss_get_mic()` and `gss_verify_mic()` are still unavailable.  Implement them
-   using the same per-message key schedule and RFC 4121-style token framing.
-
-7. Harden encrypted context state.
+5. Harden encrypted context state.
 
    `sctx` is encrypted and integrity protected, but it needs freshness and
    replay controls such as expiration, single-use identifiers, or cache-backed
    replay detection.
 
-8. Settle mechanism identity and packaging.
+6. Settle mechanism identity and packaging.
 
    Replace the private placeholder OID before real deployment, document
    installation for Heimdal and MIT krb5, and add packaging/install targets.
 
-9. Add interoperability tests.
+7. Add interoperability tests.
 
    Keep the current Heimdal loader and `/usr/local/bin/gss-token` tests, then
    add tests for agent-backed user keys, host-key policy, HTTP-style

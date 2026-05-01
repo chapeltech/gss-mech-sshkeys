@@ -1,8 +1,23 @@
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 pub const HEADER_LEN: usize = 16;
+pub const CHECKSUM_TOKEN_ID: [u8; 2] = [0x04, 0x04];
 pub const MESSAGE_TOKEN_ID: [u8; 2] = [0x05, 0x04];
 pub const FLAG_SENT_BY_ACCEPTOR: u8 = 0x01;
 pub const FLAG_SEALED: u8 = 0x02;
 pub const FILLER: u8 = 0xff;
+pub const AES256_GCM_SHA256_CHECKSUM_LEN: usize = 32;
+pub const AES256_GCM_SHA256_SEALED_OVERHEAD: usize = 16;
+pub const AES256_GCM_SHA256_NONCE_LEN: usize = 12;
+
+const ACCEPTOR_SEAL_LABEL: &[u8] = b"RFC4121 KG-USAGE-ACCEPTOR-SEAL 22";
+const ACCEPTOR_SIGN_LABEL: &[u8] = b"RFC4121 KG-USAGE-ACCEPTOR-SIGN 23";
+const INITIATOR_SEAL_LABEL: &[u8] = b"RFC4121 KG-USAGE-INITIATOR-SEAL 24";
+const INITIATOR_SIGN_LABEL: &[u8] = b"RFC4121 KG-USAGE-INITIATOR-SIGN 25";
+const NONCE_LABEL: &[u8] = b"RFC4121 AES-256-GCM nonce";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Role {
@@ -74,6 +89,111 @@ pub struct ProtectionResult {
 pub struct UnprotectionResult {
     pub plaintext: Vec<u8>,
     pub sealed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChecksumResult {
+    pub token: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferPlan {
+    pub header_len: usize,
+    pub data_len: usize,
+    pub trailer_len: usize,
+    pub stream_len: usize,
+    pub sealed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Aes256GcmSha256Profile {
+    session_key: Vec<u8>,
+}
+
+impl Aes256GcmSha256Profile {
+    pub fn new(session_key: impl AsRef<[u8]>) -> Self {
+        Self {
+            session_key: session_key.as_ref().to_vec(),
+        }
+    }
+}
+
+impl CryptoProfile for Aes256GcmSha256Profile {
+    const CHECKSUM_LEN: usize = AES256_GCM_SHA256_CHECKSUM_LEN;
+    const SEALED_OVERHEAD: usize = AES256_GCM_SHA256_SEALED_OVERHEAD;
+
+    fn seal(
+        &self,
+        sender: Role,
+        seq: u64,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let key = derive_aes256_gcm_sha256_key(
+            &self.session_key,
+            sender.is_acceptor(),
+            true,
+        )?;
+        let nonce =
+            derive_aes256_gcm_sha256_nonce(&key, sender.is_acceptor(), seq)?;
+        aes256_gcm_encrypt(&key, &nonce, aad, plaintext)
+    }
+
+    fn open(
+        &self,
+        sender: Role,
+        seq: u64,
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let key = derive_aes256_gcm_sha256_key(
+            &self.session_key,
+            sender.is_acceptor(),
+            true,
+        )?;
+        let nonce =
+            derive_aes256_gcm_sha256_nonce(&key, sender.is_acceptor(), seq)?;
+        aes256_gcm_decrypt(&key, &nonce, aad, ciphertext)
+    }
+
+    fn sign(
+        &self,
+        sender: Role,
+        _seq: u64,
+        aad: &[u8],
+        plaintext: &[u8],
+        checksum_header: &[u8; HEADER_LEN],
+    ) -> Result<Vec<u8>, Error> {
+        let key = derive_aes256_gcm_sha256_key(
+            &self.session_key,
+            sender.is_acceptor(),
+            false,
+        )?;
+        let mut signed =
+            Vec::with_capacity(aad.len() + plaintext.len() + HEADER_LEN);
+        signed.extend_from_slice(aad);
+        signed.extend_from_slice(plaintext);
+        signed.extend_from_slice(checksum_header);
+        Ok(hmac_sha256(&key, &signed)?.to_vec())
+    }
+
+    fn verify(
+        &self,
+        sender: Role,
+        seq: u64,
+        aad: &[u8],
+        plaintext: &[u8],
+        checksum_header: &[u8; HEADER_LEN],
+        checksum: &[u8],
+    ) -> Result<(), Error> {
+        let expected =
+            self.sign(sender, seq, aad, plaintext, checksum_header)?;
+        if constant_time_eq(checksum, &expected) {
+            Ok(())
+        } else {
+            Err(Error::BadSignature)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -221,6 +341,74 @@ impl TokenState {
         self.recv_seq = self.recv_seq.wrapping_add(1);
         Ok(UnprotectionResult { plaintext, sealed })
     }
+
+    pub fn checksum<P: CryptoProfile>(
+        &mut self,
+        profile: &P,
+        message: &[u8],
+    ) -> Result<ChecksumResult, Error> {
+        let sender = self.local_role;
+        let seq = self.send_seq;
+        let checksum_header = checksum_header(sender, seq);
+        let checksum =
+            profile.sign(sender, seq, &[], message, &checksum_header)?;
+        let mut token = Vec::with_capacity(HEADER_LEN + checksum.len());
+        token.extend_from_slice(&checksum_header);
+        token.extend_from_slice(&checksum);
+
+        self.send_seq = self.send_seq.wrapping_add(1);
+        Ok(ChecksumResult { token })
+    }
+
+    pub fn verify_checksum<P: CryptoProfile>(
+        &mut self,
+        profile: &P,
+        message: &[u8],
+        token: &[u8],
+    ) -> Result<(), Error> {
+        if token.len() < HEADER_LEN {
+            return Err(Error::DefectiveToken);
+        }
+
+        let mut header = [0u8; HEADER_LEN];
+        header.copy_from_slice(&token[..HEADER_LEN]);
+        if header[..2] != CHECKSUM_TOKEN_ID
+            || header[3..8].iter().any(|byte| *byte != FILLER)
+        {
+            return Err(Error::DefectiveToken);
+        }
+
+        let sender = if header[2] & FLAG_SENT_BY_ACCEPTOR != 0 {
+            Role::Acceptor
+        } else {
+            Role::Initiator
+        };
+        if sender == self.local_role {
+            return Err(Error::BadSignature);
+        }
+
+        let flags = header[2] & !FLAG_SENT_BY_ACCEPTOR;
+        if flags != 0 {
+            return Err(Error::DefectiveToken);
+        }
+
+        let seq = u64::from_be_bytes(
+            header[8..16]
+                .try_into()
+                .map_err(|_| Error::DefectiveToken)?,
+        );
+        if seq != self.recv_seq {
+            return Err(Error::Sequence);
+        }
+
+        let checksum = &token[HEADER_LEN..];
+        if checksum.len() != P::CHECKSUM_LEN {
+            return Err(Error::DefectiveToken);
+        }
+        profile.verify(sender, seq, &[], message, &header, checksum)?;
+        self.recv_seq = self.recv_seq.wrapping_add(1);
+        Ok(())
+    }
 }
 
 pub fn trailer_len<P: CryptoProfile>(sealed: bool) -> usize {
@@ -229,6 +417,25 @@ pub fn trailer_len<P: CryptoProfile>(sealed: bool) -> usize {
     } else {
         P::CHECKSUM_LEN
     }
+}
+
+pub fn buffer_plan<P: CryptoProfile>(
+    data_len: usize,
+    sealed: bool,
+) -> Result<BufferPlan, Error> {
+    let trailer_len = trailer_len::<P>(sealed);
+    let stream_len = HEADER_LEN
+        .checked_add(data_len)
+        .and_then(|len| len.checked_add(trailer_len))
+        .ok_or(Error::Failure)?;
+
+    Ok(BufferPlan {
+        header_len: HEADER_LEN,
+        data_len,
+        trailer_len,
+        stream_len,
+        sealed,
+    })
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -267,6 +474,18 @@ fn header(
     header
 }
 
+fn checksum_header(sender: Role, seq: u64) -> [u8; HEADER_LEN] {
+    let mut header = [FILLER; HEADER_LEN];
+    header[..2].copy_from_slice(&CHECKSUM_TOKEN_ID);
+    header[2] = if sender.is_acceptor() {
+        FLAG_SENT_BY_ACCEPTOR
+    } else {
+        0
+    };
+    header[8..16].copy_from_slice(&seq.to_be_bytes());
+    header
+}
+
 fn header_with_zero_ec_rrc(header: &[u8; HEADER_LEN]) -> [u8; HEADER_LEN] {
     let mut out = *header;
     out[4..8].fill(0);
@@ -277,6 +496,88 @@ fn header_with_zero_rrc(header: &[u8; HEADER_LEN]) -> [u8; HEADER_LEN] {
     let mut out = *header;
     out[6..8].fill(0);
     out
+}
+
+fn derive_aes256_gcm_sha256_key(
+    session_key: &[u8],
+    sender_acceptor: bool,
+    seal: bool,
+) -> Result<[u8; AES256_GCM_SHA256_CHECKSUM_LEN], Error> {
+    let label = match (sender_acceptor, seal) {
+        (true, true) => ACCEPTOR_SEAL_LABEL,
+        (true, false) => ACCEPTOR_SIGN_LABEL,
+        (false, true) => INITIATOR_SEAL_LABEL,
+        (false, false) => INITIATOR_SIGN_LABEL,
+    };
+
+    hmac_sha256(session_key, label)
+}
+
+fn derive_aes256_gcm_sha256_nonce(
+    key: &[u8; AES256_GCM_SHA256_CHECKSUM_LEN],
+    sender_acceptor: bool,
+    seq: u64,
+) -> Result<[u8; AES256_GCM_SHA256_NONCE_LEN], Error> {
+    let mut data = Vec::with_capacity(32);
+    data.extend_from_slice(NONCE_LABEL);
+    data.push(u8::from(sender_acceptor));
+    data.extend_from_slice(&seq.to_be_bytes());
+
+    let digest = hmac_sha256(key, &data)?;
+    let mut nonce = [0u8; AES256_GCM_SHA256_NONCE_LEN];
+    nonce.copy_from_slice(&digest[..AES256_GCM_SHA256_NONCE_LEN]);
+    Ok(nonce)
+}
+
+fn hmac_sha256(
+    key: &[u8],
+    data: &[u8],
+) -> Result<[u8; AES256_GCM_SHA256_CHECKSUM_LEN], Error> {
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(key).map_err(|_| Error::Failure)?;
+    mac.update(data);
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0u8; AES256_GCM_SHA256_CHECKSUM_LEN];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn aes256_gcm_encrypt(
+    key: &[u8; AES256_GCM_SHA256_CHECKSUM_LEN],
+    nonce: &[u8; AES256_GCM_SHA256_NONCE_LEN],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| Error::Failure)?;
+    cipher
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| Error::Failure)
+}
+
+fn aes256_gcm_decrypt(
+    key: &[u8; AES256_GCM_SHA256_CHECKSUM_LEN],
+    nonce: &[u8; AES256_GCM_SHA256_NONCE_LEN],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| Error::Failure)?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| Error::BadSignature)
 }
 
 fn unrotate_body(body: &[u8], rrc: u16) -> Vec<u8> {
@@ -456,5 +757,68 @@ mod tests {
                 .unwrap_err(),
             Error::BadSignature,
         );
+    }
+
+    #[test]
+    fn checksum_token_round_trips_and_rejects_tampering() {
+        let profile = ToyProfile;
+        let mut initiator = TokenState::new(Role::Initiator, 0, 0);
+        let mut acceptor = TokenState::new(Role::Acceptor, 0, 0);
+
+        let checksum = initiator.checksum(&profile, b"hello").unwrap();
+        assert_eq!(checksum.token[..2], CHECKSUM_TOKEN_ID);
+        assert_eq!(checksum.token[3..8], [FILLER; 5]);
+        assert_eq!(initiator.send_seq(), 1);
+
+        acceptor
+            .verify_checksum(&profile, b"hello", &checksum.token)
+            .unwrap();
+        assert_eq!(acceptor.recv_seq(), 1);
+
+        let checksum = initiator.checksum(&profile, b"hello").unwrap();
+        assert_eq!(
+            acceptor
+                .verify_checksum(&profile, b"HELLO", &checksum.token)
+                .unwrap_err(),
+            Error::BadSignature,
+        );
+    }
+
+    #[test]
+    fn buffer_plan_returns_split_lengths() {
+        assert_eq!(
+            buffer_plan::<ToyProfile>(7, false).unwrap(),
+            BufferPlan {
+                header_len: HEADER_LEN,
+                data_len: 7,
+                trailer_len: ToyProfile::CHECKSUM_LEN,
+                stream_len: HEADER_LEN + 7 + ToyProfile::CHECKSUM_LEN,
+                sealed: false,
+            },
+        );
+        assert_eq!(
+            buffer_plan::<ToyProfile>(7, true).unwrap().trailer_len,
+            HEADER_LEN + ToyProfile::SEALED_OVERHEAD,
+        );
+    }
+
+    #[test]
+    fn aes256_gcm_sha256_profile_round_trips() {
+        let profile = Aes256GcmSha256Profile::new([0x5a; 16]);
+        let mut initiator = TokenState::new(Role::Initiator, 0, 0);
+        let mut acceptor = TokenState::new(Role::Acceptor, 0, 0);
+
+        let sealed = initiator
+            .protect(&profile, true, b"secret", b"aad")
+            .unwrap();
+        let opened =
+            acceptor.unprotect(&profile, &sealed.token, b"aad").unwrap();
+        assert_eq!(opened.plaintext, b"secret");
+        assert!(opened.sealed);
+
+        let checksum = initiator.checksum(&profile, b"message").unwrap();
+        acceptor
+            .verify_checksum(&profile, b"message", &checksum.token)
+            .unwrap();
     }
 }
