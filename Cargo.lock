@@ -401,13 +401,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gss-mech-builder"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rfc4121",
+]
+
+[[package]]
 name = "gss-sshkey"
 version = "0.1.0"
 dependencies = [
+ "gss-mech-builder",
  "hmac",
  "libc",
  "rasn",
  "rasn-compiler",
+ "rfc4121",
  "sha1",
  "sha2",
  "signature",
@@ -928,6 +938,10 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "rfc4121"
+version = "0.1.0"
 
 [[package]]
 name = "rfc6979"

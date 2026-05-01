@@ -14,12 +14,15 @@ all: $(TARGET)
 test: test-rust test-gss-token
 
 test-rust:
-	$(CARGO) test
+	$(CARGO) test --workspace
 
 test-gss-token: $(TARGET)
 	tests/gss-token/run.sh
 
-$(TARGET): Cargo.toml build.rs src/lib.rs sshkey.asn1
+$(TARGET): Cargo.toml build.rs src/lib.rs sshkey.asn1 \
+    crates/gss-mech-builder/Cargo.toml \
+    crates/gss-mech-builder/src/lib.rs \
+    crates/rfc4121/Cargo.toml crates/rfc4121/src/lib.rs
 	$(CARGO) build --release
 	cp $(RUST_LIB) $(TARGET)
 

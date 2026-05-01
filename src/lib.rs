@@ -3,8 +3,8 @@
 
 use core::ffi::c_void;
 use core::ptr;
-use std::ffi::CString;
 use std::env;
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -13,9 +13,13 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use asn1::sshkey::{
-    EncCtx, EncSshKeyUserAuth, SshKeyHostAuth, SshKeyKEX,
-    SshKeyFinished, SshKeyServerContext, SshKeyStatus, SshKeyToken,
-    SshKeyUserAuth,
+    EncCtx, EncSshKeyUserAuth, SshKeyFinished, SshKeyHostAuth, SshKeyKEX,
+    SshKeyServerContext, SshKeyStatus, SshKeyToken, SshKeyUserAuth,
+};
+use gss_mech_builder::sys::*;
+use gss_mech_builder::{
+    clear_buffer, iov_buffer_type, release_iov_allocations, set_buffer_bytes,
+    set_minor,
 };
 use hmac::{Hmac, Mac};
 use rasn::types::{Integer, OctetString};
@@ -34,23 +38,6 @@ mod asn1 {
     include!(concat!(env!("OUT_DIR"), "/sshkey_asn1.rs"));
 }
 
-type OM_uint32 = u32;
-type gss_cred_usage_t = i32;
-type gss_qop_t = u32;
-type gss_OID = *mut gss_OID_desc;
-type gss_const_OID = *const gss_OID_desc;
-type gss_OID_set = *mut gss_OID_set_desc;
-type gss_const_OID_set = *const gss_OID_set_desc;
-type gss_name_t = *mut gss_name_t_desc;
-type gss_const_name_t = *const gss_name_t_desc;
-type gss_buffer_t = *mut gss_buffer_desc;
-type gss_iov_buffer_t = *mut gss_iov_buffer_desc;
-type gss_const_ctx_id_t = *const c_void;
-type gss_ctx_id_t = *mut c_void;
-type gss_const_cred_id_t = *const c_void;
-type gss_cred_id_t = *mut c_void;
-type gss_channel_bindings_t = *const gss_channel_bindings_struct;
-type c_int = i32;
 type c_uchar = u8;
 type c_uint = u32;
 
@@ -84,62 +71,22 @@ const EVP_CTRL_GCM_SET_IVLEN: c_int = 0x9;
 const EVP_CTRL_GCM_GET_TAG: c_int = 0x10;
 const EVP_CTRL_GCM_SET_TAG: c_int = 0x11;
 
-const GSS_S_COMPLETE: OM_uint32 = 0;
-const GSS_S_CONTINUE_NEEDED: OM_uint32 = 1;
-const GSS_S_BAD_MECH: OM_uint32 = 1 << 16;
-const GSS_S_BAD_NAME: OM_uint32 = 2 << 16;
-const GSS_S_BAD_SIG: OM_uint32 = 6 << 16;
-const GSS_S_NO_CONTEXT: OM_uint32 = 8 << 16;
-const GSS_S_DEFECTIVE_TOKEN: OM_uint32 = 9 << 16;
-const GSS_S_FAILURE: OM_uint32 = 13 << 16;
-const GSS_S_UNAVAILABLE: OM_uint32 = 16 << 16;
-const GSS_S_UNSEQ_TOKEN: OM_uint32 = 1 << 3;
-const GSS_C_BOTH: gss_cred_usage_t = 0;
-const GSS_C_INDEFINITE: OM_uint32 = 0xffff_ffff;
-const GSS_C_REPLAY_FLAG: OM_uint32 = 4;
-const GSS_C_SEQUENCE_FLAG: OM_uint32 = 8;
-const GSS_C_CONF_FLAG: OM_uint32 = 16;
-const GSS_C_INTEG_FLAG: OM_uint32 = 32;
-const GSS_C_ANON_FLAG: OM_uint32 = 64;
-const GSS_C_TRANS_FLAG: OM_uint32 = 256;
-const GSS_C_CHANNEL_BOUND_FLAG: OM_uint32 = 2048;
-
-const GSS_IOV_BUFFER_TYPE_EMPTY: OM_uint32 = 0;
-const GSS_IOV_BUFFER_TYPE_DATA: OM_uint32 = 1;
-const GSS_IOV_BUFFER_TYPE_HEADER: OM_uint32 = 2;
-const GSS_IOV_BUFFER_TYPE_TRAILER: OM_uint32 = 7;
-const GSS_IOV_BUFFER_TYPE_PADDING: OM_uint32 = 9;
-const GSS_IOV_BUFFER_TYPE_STREAM: OM_uint32 = 10;
-const GSS_IOV_BUFFER_TYPE_SIGN_ONLY: OM_uint32 = 11;
-const GSS_IOV_BUFFER_TYPE_FLAG_MASK: OM_uint32 = 0xffff_0000;
-const GSS_IOV_BUFFER_FLAG_ALLOCATE: OM_uint32 = 0x0001_0000;
-const GSS_IOV_BUFFER_FLAG_ALLOCATED: OM_uint32 = 0x0002_0000;
-
 const SSH_KEY_COMPLETE: u8 = 1;
 const SSH_KEY_CONTINUE_NEEDED: u8 = 2;
-
-const ENOMEM: OM_uint32 = 12;
-const ENOTSUP: OM_uint32 = 95;
-const EINVAL: OM_uint32 = 22;
 
 static SSHKEY_OID_ELEMENTS: [u8; 9] =
     [0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x01];
 
 const KEX_ALG: &[u8] = b"curve25519-sha256";
 const ENC_ALG: &[u8] = b"aes256-gcm-sha256";
-const SIG_ALGS: &[u8] =
-    b"ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,\
+const SIG_ALGS: &[u8] = b"ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,\
 ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-dss";
 const SANON_KDF_LABEL: &[u8] = b"sanon-x25519";
 const SANON_SESSION_KEY_LEN: usize = 16;
 const X25519_PUBLIC_LEN: usize = 32;
 const X25519_SHARED_LEN: usize = 32;
 const CONTEXT_KEY_LEN: usize = 32;
-const CFX_HEADER_LEN: usize = 16;
-const CFX_WRAP_TOK_ID: [u8; 2] = [0x05, 0x04];
-const CFX_FLAG_SENT_BY_ACCEPTOR: u8 = 0x01;
-const CFX_FLAG_SEALED: u8 = 0x02;
-const CFX_FILLER: u8 = 0xff;
+const CFX_HEADER_LEN: usize = rfc4121::HEADER_LEN;
 const CFX_HMAC_LEN: usize = 32;
 const CFX_GCM_TAG_LEN: usize = 16;
 const CFX_GCM_NONCE_LEN: usize = 12;
@@ -150,8 +97,7 @@ const FINISHED_KEY_LABEL: &[u8] = b"SSHKEY finished key v1";
 const INITIATOR_FINISHED_LABEL: &[u8] = b"gss-sshkey initiator finished v1";
 const ACCEPTOR_FINISHED_LABEL: &[u8] = b"gss-sshkey acceptor finished v1";
 const HOSTAUTH_TRANSCRIPT_LABEL: &[u8] = b"gss-sshkey hostauth v1";
-const HOSTCHALLENGE_TRANSCRIPT_LABEL: &[u8] =
-    b"gss-sshkey hostchallenge v1";
+const HOSTCHALLENGE_TRANSCRIPT_LABEL: &[u8] = b"gss-sshkey hostchallenge v1";
 const USERAUTH_TRANSCRIPT_LABEL: &[u8] = b"gss-sshkey userauth v1";
 const SSHKEY_CTX_KEY_ENV: &str = "SSHKEY_CTX_KEY";
 const SSHKEY_HOST_KEY_ENV: &str = "SSHKEY_HOST_KEY";
@@ -296,45 +242,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-#[repr(C)]
-pub struct gss_OID_desc {
-    length: OM_uint32,
-    elements: *mut c_void,
-}
-
-#[repr(C)]
-pub struct gss_OID_set_desc {
-    count: usize,
-    elements: *mut gss_OID_desc,
-}
-
-#[repr(C)]
-pub struct gss_buffer_desc {
-    length: usize,
-    value: *mut c_void,
-}
-
-#[repr(C)]
-pub struct gss_channel_bindings_struct {
-    initiator_addrtype: OM_uint32,
-    initiator_address: gss_buffer_desc,
-    acceptor_addrtype: OM_uint32,
-    acceptor_address: gss_buffer_desc,
-    application_data: gss_buffer_desc,
-}
-
-#[repr(C)]
-pub struct gss_iov_buffer_desc {
-    type_: OM_uint32,
-    buffer: gss_buffer_desc,
-}
-
-#[repr(C)]
-pub struct gss_name_t_desc {
-    value: *mut c_void,
-    length: u32,
-}
-
 struct SshKeyCtx {
     is_initiator: bool,
     complete: bool,
@@ -391,19 +298,6 @@ impl Drop for OpenSslPkey {
     }
 }
 
-unsafe fn set_minor(minor: *mut OM_uint32, value: OM_uint32) {
-    if !minor.is_null() {
-        *minor = value;
-    }
-}
-
-unsafe fn clear_buffer(buf: gss_buffer_t) {
-    if !buf.is_null() {
-        (*buf).length = 0;
-        (*buf).value = ptr::null_mut();
-    }
-}
-
 unsafe fn malloc_copy(bytes: &[u8]) -> *mut c_void {
     if bytes.is_empty() {
         return ptr::null_mut();
@@ -418,29 +312,6 @@ unsafe fn malloc_copy(bytes: &[u8]) -> *mut c_void {
 
 unsafe fn set_buffer(minor: *mut OM_uint32, buf: gss_buffer_t, s: &str) -> u32 {
     set_buffer_bytes(minor, buf, s.as_bytes())
-}
-
-unsafe fn set_buffer_bytes(
-    minor: *mut OM_uint32,
-    buf: gss_buffer_t,
-    bytes: &[u8],
-) -> u32 {
-    if buf.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_FAILURE;
-    }
-
-    let out = malloc_copy(bytes);
-    if out.is_null() && !bytes.is_empty() {
-        clear_buffer(buf);
-        set_minor(minor, ENOMEM);
-        return GSS_S_FAILURE;
-    }
-
-    (*buf).length = bytes.len();
-    (*buf).value = out;
-    set_minor(minor, 0);
-    GSS_S_COMPLETE
 }
 
 unsafe fn channel_binding_application_data(
@@ -462,10 +333,6 @@ unsafe fn channel_binding_application_data(
         core::slice::from_raw_parts(app.value.cast::<u8>(), app.length)
             .to_vec(),
     )
-}
-
-fn iov_buffer_type(type_: OM_uint32) -> OM_uint32 {
-    type_ & !GSS_IOV_BUFFER_TYPE_FLAG_MASK
 }
 
 fn iov_buffer_flags(type_: OM_uint32) -> OM_uint32 {
@@ -549,30 +416,8 @@ unsafe fn set_iov_length(
     Ok(())
 }
 
-unsafe fn release_iov_allocations(iov: gss_iov_buffer_t, iov_count: c_int) {
-    if iov.is_null() || iov_count <= 0 {
-        return;
-    }
-
-    let buffers = core::slice::from_raw_parts_mut(iov, iov_count as usize);
-    for buffer in buffers {
-        if (buffer.type_ & GSS_IOV_BUFFER_FLAG_ALLOCATED) != 0 {
-            if !buffer.buffer.value.is_null() {
-                libc::free(buffer.buffer.value);
-            }
-            buffer.buffer.length = 0;
-            buffer.buffer.value = ptr::null_mut();
-            buffer.type_ &= !GSS_IOV_BUFFER_FLAG_ALLOCATED;
-        }
-    }
-}
-
 fn cfx_trailer_len(sealed: bool) -> usize {
-    if sealed {
-        CFX_HEADER_LEN + CFX_GCM_TAG_LEN
-    } else {
-        CFX_HMAC_LEN
-    }
+    rfc4121::trailer_len::<SshKeyRfc4121Profile>(sealed)
 }
 
 fn token_status(value: u8) -> SshKeyStatus {
@@ -1248,8 +1093,7 @@ fn host_key_is_trusted(host: &str, key_blob: &[u8]) -> bool {
 }
 
 fn alg_list_contains(list: &[u8], alg: &[u8]) -> bool {
-    list.split(|byte| *byte == b',')
-        .any(|item| item == alg)
+    list.split(|byte| *byte == b',').any(|item| item == alg)
 }
 
 fn host_signature_input(
@@ -1555,12 +1399,7 @@ unsafe fn encrypted_userauth(
             if signature.algorithm().as_str().as_bytes() != sigtype {
                 continue;
             }
-            if !verify_ssh_signature(
-                &identity.key,
-                &sigtype,
-                &sig,
-                &input,
-            ) {
+            if !verify_ssh_signature(&identity.key, &sigtype, &sig, &input) {
                 continue;
             }
 
@@ -1834,68 +1673,6 @@ unsafe fn derive_cfx_nonce(
     Some(nonce)
 }
 
-fn cfx_header(
-    sender_acceptor: bool,
-    sealed: bool,
-    ec: u16,
-    rrc: u16,
-    seq: u64,
-) -> [u8; CFX_HEADER_LEN] {
-    // RFC 4121 section 4.2.6.2: Wrap tokens use TOK_ID 05 04,
-    // one flags octet, FF filler, EC, RRC, and big-endian SND_SEQ.
-    let mut header = [0u8; CFX_HEADER_LEN];
-    header[..2].copy_from_slice(&CFX_WRAP_TOK_ID);
-    header[2] = if sender_acceptor {
-        CFX_FLAG_SENT_BY_ACCEPTOR
-    } else {
-        0
-    };
-    if sealed {
-        header[2] |= CFX_FLAG_SEALED;
-    }
-    header[3] = CFX_FILLER;
-    header[4..6].copy_from_slice(&ec.to_be_bytes());
-    header[6..8].copy_from_slice(&rrc.to_be_bytes());
-    header[8..16].copy_from_slice(&seq.to_be_bytes());
-    header
-}
-
-fn cfx_header_with_zero_ec_rrc(header: &[u8; CFX_HEADER_LEN]) -> [u8; 16] {
-    let mut out = *header;
-    out[4..8].fill(0);
-    out
-}
-
-fn cfx_header_with_zero_rrc(header: &[u8; CFX_HEADER_LEN]) -> [u8; 16] {
-    let mut out = *header;
-    out[6..8].fill(0);
-    out
-}
-
-fn cfx_unrotate_body(body: &[u8], rrc: u16) -> Vec<u8> {
-    if body.is_empty() {
-        return Vec::new();
-    }
-
-    let shift = usize::from(rrc) % body.len();
-    let mut out = Vec::with_capacity(body.len());
-    out.extend_from_slice(&body[shift..]);
-    out.extend_from_slice(&body[..shift]);
-    out
-}
-
-fn cfx_constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut diff = 0u8;
-    for (left, right) in a.iter().zip(b) {
-        diff |= left ^ right;
-    }
-    diff == 0
-}
-
 unsafe fn aes_256_gcm_encrypt(
     key: &[u8; CFX_HMAC_LEN],
     nonce: &[u8; CFX_GCM_NONCE_LEN],
@@ -2061,6 +1838,110 @@ unsafe fn cfx_wrap_message(
     cfx_wrap_message_with_aad(ctx, conf_req, plaintext, &[])
 }
 
+struct SshKeyRfc4121Profile {
+    session_key: [u8; SANON_SESSION_KEY_LEN],
+}
+
+impl rfc4121::CryptoProfile for SshKeyRfc4121Profile {
+    const CHECKSUM_LEN: usize = CFX_HMAC_LEN;
+    const SEALED_OVERHEAD: usize = CFX_GCM_TAG_LEN;
+
+    fn seal(
+        &self,
+        sender: rfc4121::Role,
+        seq: u64,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, rfc4121::Error> {
+        unsafe {
+            let sender_acceptor = sender.is_acceptor();
+            let key = derive_cfx_key(&self.session_key, sender_acceptor, true)
+                .ok_or(rfc4121::Error::Failure)?;
+            let nonce = derive_cfx_nonce(&key, sender_acceptor, seq)
+                .ok_or(rfc4121::Error::Failure)?;
+            aes_256_gcm_encrypt(&key, &nonce, aad, plaintext)
+                .ok_or(rfc4121::Error::Failure)
+        }
+    }
+
+    fn open(
+        &self,
+        sender: rfc4121::Role,
+        seq: u64,
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, rfc4121::Error> {
+        unsafe {
+            let sender_acceptor = sender.is_acceptor();
+            let key = derive_cfx_key(&self.session_key, sender_acceptor, true)
+                .ok_or(rfc4121::Error::Failure)?;
+            let nonce = derive_cfx_nonce(&key, sender_acceptor, seq)
+                .ok_or(rfc4121::Error::Failure)?;
+            aes_256_gcm_decrypt(&key, &nonce, aad, ciphertext)
+                .ok_or(rfc4121::Error::BadSignature)
+        }
+    }
+
+    fn sign(
+        &self,
+        sender: rfc4121::Role,
+        _seq: u64,
+        aad: &[u8],
+        plaintext: &[u8],
+        checksum_header: &[u8; CFX_HEADER_LEN],
+    ) -> Result<Vec<u8>, rfc4121::Error> {
+        unsafe {
+            let key =
+                derive_cfx_key(&self.session_key, sender.is_acceptor(), false)
+                    .ok_or(rfc4121::Error::Failure)?;
+            let mut signed = Vec::with_capacity(
+                aad.len() + plaintext.len() + CFX_HEADER_LEN,
+            );
+            signed.extend_from_slice(aad);
+            signed.extend_from_slice(plaintext);
+            signed.extend_from_slice(checksum_header);
+            hmac_sha256(&key, &signed)
+                .map(Vec::from)
+                .ok_or(rfc4121::Error::Failure)
+        }
+    }
+
+    fn verify(
+        &self,
+        sender: rfc4121::Role,
+        seq: u64,
+        aad: &[u8],
+        plaintext: &[u8],
+        checksum_header: &[u8; CFX_HEADER_LEN],
+        checksum: &[u8],
+    ) -> Result<(), rfc4121::Error> {
+        let expected =
+            self.sign(sender, seq, aad, plaintext, checksum_header)?;
+        if rfc4121::constant_time_eq(checksum, &expected) {
+            Ok(())
+        } else {
+            Err(rfc4121::Error::BadSignature)
+        }
+    }
+}
+
+fn cfx_role(is_initiator: bool) -> rfc4121::Role {
+    if is_initiator {
+        rfc4121::Role::Initiator
+    } else {
+        rfc4121::Role::Acceptor
+    }
+}
+
+fn cfx_error_major(error: rfc4121::Error) -> OM_uint32 {
+    match error {
+        rfc4121::Error::BadSignature => GSS_S_BAD_SIG,
+        rfc4121::Error::DefectiveToken => GSS_S_DEFECTIVE_TOKEN,
+        rfc4121::Error::Failure => GSS_S_FAILURE,
+        rfc4121::Error::Sequence => GSS_S_UNSEQ_TOKEN,
+    }
+}
+
 unsafe fn cfx_wrap_message_with_aad(
     ctx: &mut SshKeyCtx,
     conf_req: bool,
@@ -2074,51 +1955,19 @@ unsafe fn cfx_wrap_message_with_aad(
         return Err(GSS_S_NO_CONTEXT);
     };
 
-    let sender_acceptor = !ctx.is_initiator;
-    let seq = ctx.send_seq;
-
-    if conf_req {
-        // RFC 4121 section 4.2.4: confidential Wrap encrypts
-        // plaintext-data | filler | header.  We use zero filler.
-        let header = cfx_header(sender_acceptor, true, 0, 0, seq);
-        let key = derive_cfx_key(session_key, sender_acceptor, true)
-            .ok_or(GSS_S_FAILURE)?;
-        let nonce = derive_cfx_nonce(&key, sender_acceptor, seq)
-            .ok_or(GSS_S_FAILURE)?;
-        let mut sealed = Vec::with_capacity(plaintext.len() + CFX_HEADER_LEN);
-        sealed.extend_from_slice(plaintext);
-        sealed.extend_from_slice(&header);
-
-        let body = aes_256_gcm_encrypt(&key, &nonce, aad, &sealed)
-            .ok_or(GSS_S_FAILURE)?;
-        let mut token = Vec::with_capacity(CFX_HEADER_LEN + body.len());
-        token.extend_from_slice(&header);
-        token.extend_from_slice(&body);
-        ctx.send_seq = ctx.send_seq.wrapping_add(1);
-        return Ok((token, true));
-    }
-
-    // RFC 4121 section 4.2.4: non-confidential Wrap signs the plaintext
-    // followed by the header with EC and RRC zeroed for checksum input.
-    let checksum_header = cfx_header(sender_acceptor, false, 0, 0, seq);
-    let key = derive_cfx_key(session_key, sender_acceptor, false)
-        .ok_or(GSS_S_FAILURE)?;
-    let mut signed =
-        Vec::with_capacity(aad.len() + plaintext.len() + CFX_HEADER_LEN);
-    signed.extend_from_slice(aad);
-    signed.extend_from_slice(plaintext);
-    signed.extend_from_slice(&checksum_header);
-    let checksum = hmac_sha256(&key, &signed).ok_or(GSS_S_FAILURE)?;
-    let header =
-        cfx_header(sender_acceptor, false, CFX_HMAC_LEN as u16, 0, seq);
-
-    let mut token =
-        Vec::with_capacity(CFX_HEADER_LEN + plaintext.len() + checksum.len());
-    token.extend_from_slice(&header);
-    token.extend_from_slice(plaintext);
-    token.extend_from_slice(&checksum);
-    ctx.send_seq = ctx.send_seq.wrapping_add(1);
-    Ok((token, false))
+    let profile = SshKeyRfc4121Profile {
+        session_key: *session_key,
+    };
+    let mut state = rfc4121::TokenState::new(
+        cfx_role(ctx.is_initiator),
+        ctx.send_seq,
+        ctx.recv_seq,
+    );
+    let result = state
+        .protect(&profile, conf_req, plaintext, aad)
+        .map_err(cfx_error_major)?;
+    ctx.send_seq = state.send_seq();
+    Ok((result.token, result.sealed))
 }
 
 #[cfg(test)]
@@ -2140,71 +1989,20 @@ unsafe fn cfx_unwrap_message_with_aad(
     let Some(session_key) = ctx.session_key.as_ref() else {
         return Err(GSS_S_NO_CONTEXT);
     };
-    if token.len() < CFX_HEADER_LEN {
-        return Err(GSS_S_DEFECTIVE_TOKEN);
-    }
 
-    let mut header = [0u8; CFX_HEADER_LEN];
-    header.copy_from_slice(&token[..CFX_HEADER_LEN]);
-    if header[..2] != CFX_WRAP_TOK_ID || header[3] != CFX_FILLER {
-        return Err(GSS_S_DEFECTIVE_TOKEN);
-    }
-
-    let sender_acceptor = (header[2] & CFX_FLAG_SENT_BY_ACCEPTOR) != 0;
-    if sender_acceptor != ctx.is_initiator {
-        return Err(GSS_S_BAD_SIG);
-    }
-    let sealed = (header[2] & CFX_FLAG_SEALED) != 0;
-    let ec = u16::from_be_bytes([header[4], header[5]]) as usize;
-    let rrc = u16::from_be_bytes([header[6], header[7]]);
-    let seq = u64::from_be_bytes(header[8..16].try_into().unwrap());
-    if seq != ctx.recv_seq {
-        return Err(GSS_S_UNSEQ_TOKEN);
-    }
-
-    let body = cfx_unrotate_body(&token[CFX_HEADER_LEN..], rrc);
-    let plaintext = if sealed {
-        let key = derive_cfx_key(session_key, sender_acceptor, true)
-            .ok_or(GSS_S_FAILURE)?;
-        let nonce = derive_cfx_nonce(&key, sender_acceptor, seq)
-            .ok_or(GSS_S_FAILURE)?;
-        let sealed = aes_256_gcm_decrypt(&key, &nonce, aad, &body)
-            .ok_or(GSS_S_BAD_SIG)?;
-        if sealed.len() < CFX_HEADER_LEN {
-            return Err(GSS_S_DEFECTIVE_TOKEN);
-        }
-        let split = sealed.len() - CFX_HEADER_LEN;
-        let (message, encrypted_header) = sealed.split_at(split);
-        // RFC 4121 section 4.2.4 requires the encrypted header copy to
-        // have RRC zero, even when the clear header uses rotation.
-        let expected_header = cfx_header_with_zero_rrc(&header);
-        if !cfx_constant_time_eq(encrypted_header, &expected_header) {
-            return Err(GSS_S_BAD_SIG);
-        }
-        message.to_vec()
-    } else {
-        if ec != CFX_HMAC_LEN || body.len() < ec {
-            return Err(GSS_S_DEFECTIVE_TOKEN);
-        }
-        let split = body.len() - ec;
-        let (message, checksum) = body.split_at(split);
-        let key = derive_cfx_key(session_key, sender_acceptor, false)
-            .ok_or(GSS_S_FAILURE)?;
-        let checksum_header = cfx_header_with_zero_ec_rrc(&header);
-        let mut signed =
-            Vec::with_capacity(aad.len() + message.len() + CFX_HEADER_LEN);
-        signed.extend_from_slice(aad);
-        signed.extend_from_slice(message);
-        signed.extend_from_slice(&checksum_header);
-        let expected = hmac_sha256(&key, &signed).ok_or(GSS_S_FAILURE)?;
-        if !cfx_constant_time_eq(checksum, &expected) {
-            return Err(GSS_S_BAD_SIG);
-        }
-        message.to_vec()
+    let profile = SshKeyRfc4121Profile {
+        session_key: *session_key,
     };
-
-    ctx.recv_seq = ctx.recv_seq.wrapping_add(1);
-    Ok((plaintext, sealed))
+    let mut state = rfc4121::TokenState::new(
+        cfx_role(ctx.is_initiator),
+        ctx.send_seq,
+        ctx.recv_seq,
+    );
+    let result = state
+        .unprotect(&profile, token, aad)
+        .map_err(cfx_error_major)?;
+    ctx.recv_seq = state.recv_seq();
+    Ok((result.plaintext, result.sealed))
 }
 
 unsafe fn iov_buffers<'a>(
@@ -3502,46 +3300,41 @@ pub unsafe extern "C" fn gss_accept_sec_context(
         set_minor(minor, EINVAL);
         return GSS_S_DEFECTIVE_TOKEN;
     };
-    let Some(acceptor_public) = server_context.acceptor_pk.as_ref()
-        .try_into()
-        .ok()
+    let Some(acceptor_public) =
+        server_context.acceptor_pk.as_ref().try_into().ok()
     else {
         set_minor(minor, EINVAL);
         return GSS_S_DEFECTIVE_TOKEN;
     };
-    let token_initiator_public = token
-        .kex
-        .as_ref()
-        .and_then(validate_initiator_kex);
-    let initiator_public = if let Some(value) =
-        server_context.initiator_pk.as_ref()
-    {
-        let Some(public) = value.as_ref().try_into().ok() else {
+    let token_initiator_public =
+        token.kex.as_ref().and_then(validate_initiator_kex);
+    let initiator_public =
+        if let Some(value) = server_context.initiator_pk.as_ref() {
+            let Some(public) = value.as_ref().try_into().ok() else {
+                set_minor(minor, EINVAL);
+                return GSS_S_DEFECTIVE_TOKEN;
+            };
+            public
+        } else {
+            let Some(public) = token_initiator_public else {
+                set_minor(minor, EINVAL);
+                return GSS_S_DEFECTIVE_TOKEN;
+            };
+            public
+        };
+    let initiator_nonce =
+        if let Some(value) = server_context.initiator_nonce.as_ref() {
+            value.as_ref().to_vec()
+        } else if let Some(kex) = token.kex.as_ref() {
+            let Some(nonce) = kex_nonce(kex) else {
+                set_minor(minor, EINVAL);
+                return GSS_S_DEFECTIVE_TOKEN;
+            };
+            nonce
+        } else {
             set_minor(minor, EINVAL);
             return GSS_S_DEFECTIVE_TOKEN;
         };
-        public
-    } else {
-        let Some(public) = token_initiator_public else {
-            set_minor(minor, EINVAL);
-            return GSS_S_DEFECTIVE_TOKEN;
-        };
-        public
-    };
-    let initiator_nonce = if let Some(value) =
-        server_context.initiator_nonce.as_ref()
-    {
-        value.as_ref().to_vec()
-    } else if let Some(kex) = token.kex.as_ref() {
-        let Some(nonce) = kex_nonce(kex) else {
-            set_minor(minor, EINVAL);
-            return GSS_S_DEFECTIVE_TOKEN;
-        };
-        nonce
-    } else {
-        set_minor(minor, EINVAL);
-        return GSS_S_DEFECTIVE_TOKEN;
-    };
     let acceptor_nonce = server_context.acceptor_nonce.as_ref().to_vec();
     if acceptor_nonce.len() != HANDSHAKE_NONCE_LEN {
         set_minor(minor, EINVAL);
@@ -3554,8 +3347,7 @@ pub unsafe extern "C" fn gss_accept_sec_context(
             return major;
         }
     };
-    let session_key = if let Some(value) = server_context.session_key.as_ref()
-    {
+    let session_key = if let Some(value) = server_context.session_key.as_ref() {
         let Some(session_key) = value.as_ref().try_into().ok() else {
             set_minor(minor, EINVAL);
             return GSS_S_DEFECTIVE_TOKEN;
@@ -3593,16 +3385,15 @@ pub unsafe extern "C" fn gss_accept_sec_context(
         };
         session_key
     };
-    let initiator_sigtypes = if let Some(value) =
-        server_context.initiator_sigtypes.as_ref()
-    {
-        value.as_ref().to_vec()
-    } else if let Some(kex) = token.kex.as_ref() {
-        kex.sigtypes.as_ref().to_vec()
-    } else {
-        set_minor(minor, EINVAL);
-        return GSS_S_DEFECTIVE_TOKEN;
-    };
+    let initiator_sigtypes =
+        if let Some(value) = server_context.initiator_sigtypes.as_ref() {
+            value.as_ref().to_vec()
+        } else if let Some(kex) = token.kex.as_ref() {
+            kex.sigtypes.as_ref().to_vec()
+        } else {
+            set_minor(minor, EINVAL);
+            return GSS_S_DEFECTIVE_TOKEN;
+        };
     let acceptor_sigtypes = server_context.acceptor_sigtypes.as_ref().to_vec();
     let Some(transcript_hash) = handshake_transcript_hash(
         &initiator_sigtypes,
@@ -3634,8 +3425,7 @@ pub unsafe extern "C" fn gss_accept_sec_context(
     let mut authenticated = false;
 
     if let Some(encuserauth) = token.encuserauth.as_ref() {
-        let Some(userauth) = decrypt_userauth(&session_key, encuserauth)
-        else {
+        let Some(userauth) = decrypt_userauth(&session_key, encuserauth) else {
             set_minor(minor, EINVAL);
             return GSS_S_BAD_SIG;
         };
@@ -4551,11 +4341,7 @@ mod tests {
         let records = parse_sshfp_response(&packet).unwrap();
 
         assert_eq!(records.len(), 1);
-        assert!(sshfp_record_matches(
-            &records[0],
-            SSHFP_KEY_ED25519,
-            &key
-        ));
+        assert!(sshfp_record_matches(&records[0], SSHFP_KEY_ED25519, &key));
 
         let mut insecure = packet;
         insecure[3] &= !DNS_FLAG_AD as u8;
@@ -4609,8 +4395,8 @@ mod tests {
                 cfx_wrap_message(&mut initiator, true, b"sealed").unwrap();
 
             assert!(sealed);
-            assert_eq!(&token[..2], &CFX_WRAP_TOK_ID);
-            assert_eq!(token[2] & CFX_FLAG_SEALED, CFX_FLAG_SEALED);
+            assert_eq!(&token[..2], &rfc4121::MESSAGE_TOKEN_ID);
+            assert_eq!(token[2] & rfc4121::FLAG_SEALED, rfc4121::FLAG_SEALED);
             assert_eq!(initiator.send_seq, 1);
 
             let (message, sealed) =

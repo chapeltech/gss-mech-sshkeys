@@ -38,6 +38,9 @@ Implemented so far:
 - Finished MAC key confirmation over the ECDH-derived session key.
 - Encrypted stateless acceptor context returned through `sctx`.
 - Client-first and acceptor-first context establishment.
+- Initial reusable `rfc4121` crate for token framing and sequence handling.
+- Initial `gss-mech-builder` crate for GSS ABI definitions and RFC4121
+  per-message scaffolding.
 - RFC 4121-style per-message wrapping with `gss_wrap`,
   `gss_unwrap`, `gss_wrap_iov`, and `gss_unwrap_iov`.
 - Smoke tests using `/usr/local/bin/gss-token`.
@@ -45,6 +48,10 @@ Implemented so far:
 Not complete yet:
 
 - `authorized_keys` lookup and authorization.
+- Completing `rfc4121` with MIC tokens, IOV planning, and a reusable
+  aes256-gcm-sha256 profile.
+- Integrating `gss-mech-builder` into this mechanism and expanding it beyond
+  per-message entrypoints.
 - Production OID assignment and packaged installation.
 
 Without a configured user key, the mechanism still completes anonymously and
@@ -81,11 +88,13 @@ make test
 ```
 
 The GSS test runner creates a private `/etc/gss/mech` mount namespace and uses
-`/usr/local/bin/gss-token` by default.  Override paths with environment
-variables when needed:
+`/usr/local/bin/gss-token` and `/usr/local/bin/knc` by default.  Override paths
+or the local `knc` port with environment variables when needed:
 
 ```sh
 GSS_TOKEN=/path/to/gss-token make test
+KNC=/path/to/knc make test
+KNC_PORT=45679 make test
 GSSAPI_LIB=/path/to/libgssapi.so make test
 ```
 
@@ -149,6 +158,5 @@ HTTP Negotiate can use this mode naturally: the server can include an
 acceptor-first token in a `401 WWW-Authenticate` header, and the client can
 return its response token in the `Authorization` header.
 
-The next step is policy: verifying the host key through normal SSH trust data
-including `known_hosts` and DNSSEC-validated SSHFP records, and checking the
-user key against the target user's `authorized_keys`.
+The next policy step is checking the user key against the target user's
+`authorized_keys`.

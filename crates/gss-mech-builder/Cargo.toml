@@ -1,0 +1,9 @@
+[package]
+name = "gss-mech-builder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+rfc4121 = { path = "../rfc4121" }
+

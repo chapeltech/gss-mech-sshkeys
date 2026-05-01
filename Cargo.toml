@@ -4,13 +4,18 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
+[workspace]
+members = [".", "crates/gss-mech-builder", "crates/rfc4121"]
+
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
+gss-mech-builder = { path = "crates/gss-mech-builder" }
 hmac = "0.12"
 libc = "0.2"
 rasn = "0.27.3"
+rfc4121 = { path = "crates/rfc4121" }
 sha1 = "0.10"
 sha2 = "0.10"
 signature = "2"
