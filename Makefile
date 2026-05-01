@@ -1,32 +1,35 @@
-CFLAGS  = -Wall -g -fPIC -I. -I/usr/include/heimdal  -I/var/tmp/openssh-install/include -I/u/elric/tree/libssh2/src 
-CFLAGS += -Wno-unused-label
-LDFLAGS = -shared -L/var/tmp/openssh-install/lib 
-LDADD   = -Wl,-rpath=/var/tmp/openssh-install/lib -lssh2 -lcrypto
-TARGET  = sshkey.so
+CARGO ?= cargo
+RUSTUP_HOME ?= $(CURDIR)/.rustup
+CARGO_HOME ?= $(CURDIR)/.cargo
+TARGET = sshkey.so
+RUST_LIB = target/release/libgss_sshkey.so
 
-SRCS=sshkey.c asn1_sshkey.c curve25519-donna.c cfx.c sequence.c
+export RUSTUP_HOME
+export CARGO_HOME
 
 all: $(TARGET)
 
-%.c: %.x
-	cp $< $@
+.PHONY: clean test test-gss-token test-rust
 
-%.h: %.hx
-	cp $< $@
+test: test-rust test-gss-token
 
-asn1_sshkey.x sshkey-priv.hx sshkey.hx sshkey_files: sshkey.asn1
-	touch asn1-template.h
-	asn1_compile --one-code-file sshkey.asn1
+test-rust:
+	$(CARGO) test
 
-$(TARGET): sshkey.c asn1_sshkey.c sshkey-priv.h sshkey.h
-	$(CC) -g -O0 $(CFLAGS) $(LDFLAGS) -o $(TARGET) $(SRCS) $(LDADD)
+test-gss-token: $(TARGET)
+	tests/gss-token/run.sh
+
+$(TARGET): Cargo.toml build.rs src/lib.rs sshkey.asn1
+	$(CARGO) build --release
+	cp $(RUST_LIB) $(TARGET)
 
 clean:
+	if command -v $(CARGO) >/dev/null 2>&1; then $(CARGO) clean; fi
 	rm -f $(TARGET)
 	rm -f asn1_sshkey.[cx]
 	rm -f asn1-template.h
 	rm -f sshkey-priv.h
 	rm -f sshkey-priv.hx
+	rm -f sshkey.h
 	rm -f sshkey.hx
 	rm -f sshkey_files
-

@@ -1,0 +1,17 @@
+[package]
+name = "gss-sshkey"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+rasn = "0.27.3"
+signature = "2"
+ssh-key = { version = "0.6.7", features = ["crypto", "dsa"] }
+
+[build-dependencies]
+rasn-compiler = "0.16.0"

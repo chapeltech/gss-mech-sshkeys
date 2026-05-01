@@ -1,11 +1,18 @@
 SSHKEY DEFINITIONS ::=
 BEGIN
 
+--
+-- SSHKEY is a GSS-API mechanism that authenticates peers using SSH public
+-- keys.  The corresponding Internet-Draft source is
+-- draft-dowdeswell-kitten-gss-sshkey-00.xml.
+--
+-- All context-establishment tokens are DER encodings of SshKeyToken.
+--
+
 SshKeyCtx ::= SEQUENCE {
 	  user	[0] OCTET STRING	OPTIONAL
-	, key	[0] OCTET STRING	OPTIONAL
-	, h	[1] OCTET STRING	OPTIONAL	-- rolling hash ???
-	-- timestamp??
+	, key	[1] OCTET STRING	OPTIONAL
+	, h	[2] OCTET STRING	OPTIONAL	-- rolling transcript hash
 }
 
 EncCtx ::= SEQUENCE {
@@ -13,52 +20,95 @@ EncCtx ::= SEQUENCE {
 }
 
 --
--- maybe we should take a hash of the request and previous request...
--- that might defeat some sort of downgrade attack or something......
-
---
--- XXXrcd: TIMESTAMPS NEED TO BE IN SOME OF OUR PACKETS??!?
+-- SshKeyUserAuth is DER encoded and encrypted into EncSshKeyUserAuth.
+-- username contains the requested authorization identity.  sig proves
+-- possession of the corresponding SSH user private key.  keytype is the SSH
+-- public key algorithm name, key is the raw SSH public key blob, sigtype is
+-- the SSH signature algorithm name, and sig is the SSH signature blob.
 
 SshKeyUserAuth ::= SEQUENCE {
 	  username	[0] OCTET STRING
-	, sig		[1] OCTET STRING	-- what are we signing?
-						-- username and session key?
-						-- Think about this one...
-						-- might need a hash or a nonce
-						-- of some things in the KEX.
+	, keytype	[1] OCTET STRING
+	, key		[2] OCTET STRING
+	, sigtype	[3] OCTET STRING
+	, sig		[4] OCTET STRING
 }
 
 EncSshKeyUserAuth ::= OCTET STRING
 
+--
+-- SshKeyHostAuth proves possession of the acceptor host key.  keytype is the
+-- SSH public key algorithm name, key is the raw SSH public key blob, sigtype
+-- is an SSH signature algorithm name, and sig is the SSH signature blob.
+
 SshKeyHostAuth ::= SEQUENCE {
-	  sigtype	[0] OCTET STRING
-	, sig		[1] OCTET STRING
+	  keytype	[0] OCTET STRING
+	, key		[1] OCTET STRING
+	, sigtype	[2] OCTET STRING
+	, sig		[3] OCTET STRING
 }
 
 --
--- Either side can start the KEX.  It's not completely symmetrical, because
--- only the server will sign its bit, because we don't want to reveal the
--- username to Mallory.
+-- The initiator sends its supported signature algorithm names in sigtypes.
+-- The acceptor replies with the signature algorithm names it is willing to
+-- accept for user authentication.  SSH public key type and signature type are
+-- separate because RSA public keys may be used with ssh-rsa, rsa-sha2-256, or
+-- rsa-sha2-512 signatures.
 --
--- For server signature, we may want 
+-- The initiator should optimistically sign the first encrypted userauth it can
+-- produce after the acceptor has returned its signed ECDH public key.  If the
+-- acceptor cannot accept that signature algorithm, it returns CONTINUE-NEEDED
+-- with an encrypted server context and a narrower sigtypes list.
 --
--- Our KEX will leave us with a generated session key which will be used for
--- any further tokens including userauth and gss_wrap/gss_unwrap, etc.
+-- GSS does not require the initiator to produce the first token.  When
+-- gss_accept_sec_context() is called with no input token, the acceptor sends
+-- the same kind of KEX token as a signed challenge.  The initiator then
+-- returns its KEX public key, the reflected encrypted server context, and
+-- encrypted userauth when available.
 --
--- XXXrcd: to tie it all together, we should keep a rolling hash and actually
---	   use said hash to generate the session key.  This will expose any
---	   shenanigans Mallory might have been up to...
+-- The anonymous ECDH profile derives its base session key using the same
+-- SP800-108 HMAC-SHA256 counter-mode KDF inputs as Heimdal SAnon-X25519:
+--
+--	K1	= raw X25519 shared secret
+--	label	= "sanon-x25519"
+--	context	= initiator-pk || acceptor-pk || uint32(0) ||
+--		  uint32(flags) || channel-binding application-data
+--	L	= 128 bits
+--
+-- SSHKEY currently sends no SAnon-style optional protocol flags, so flags is
+-- zero.  The derived base session key is used for any further tokens including
+-- userauth and gss_wrap/gss_unwrap, etc.
+--
+-- SSHKEY uses RFC 4121 CFX token framing for per-message tokens, but it is a
+-- new mechanism and does not support Kerberos DES, Triple-DES, RC4, or other
+-- legacy RFC 4121 encryption types.  The current enctype profile is
+-- aes256-gcm-sha256.
 
 SshKeyKEX ::= SEQUENCE {
 	-- Negotiation part
-	  kextypes	[0] OCTET STRING			-- curve25519 for now
-	, enctypes	[1] OCTET STRING			-- session keys
-	, sigtypes	[2] OCTET STRING			-- host keys
+	  kextypes	[0] OCTET STRING
+	, enctypes	[1] OCTET STRING
+	, sigtypes	[2] OCTET STRING
 
 	-- Proposal part
 	, kextype	[3] OCTET STRING	OPTIONAL
 	, pk		[4] OCTET STRING	OPTIONAL
 	, enctype	[5] OCTET STRING	OPTIONAL
+}
+
+--
+-- SshKeyServerContext is DER encoded and encrypted into SshKeyToken.sctx.
+-- The client must return sctx unchanged with any continuation token so another
+-- acceptor process with the same context-protection key can finish the
+-- authentication.
+
+SshKeyServerContext ::= SEQUENCE {
+	  initiatorPk	[0] OCTET STRING	OPTIONAL
+	, acceptorPk	[1] OCTET STRING
+	, sessionKey	[2] OCTET STRING	OPTIONAL
+	, initiatorSigtypes [3] OCTET STRING	OPTIONAL
+	, acceptorSigtypes [4] OCTET STRING
+	, acceptorSk	[5] OCTET STRING	OPTIONAL
 }
 
 --
@@ -75,8 +125,8 @@ SshKeyToken ::= SEQUENCE {
 	, kex		[1] SshKeyKEX		OPTIONAL
 	, hostauth	[2] SshKeyHostAuth	OPTIONAL
 	, encuserauth	[3] EncSshKeyUserAuth	OPTIONAL
-	, cctx		[1] EncCtx		OPTIONAL
-	, sctx		[0] EncCtx		OPTIONAL
+	, cctx		[4] EncCtx		OPTIONAL
+	, sctx		[5] EncCtx		OPTIONAL
 }
 
 --
@@ -97,7 +147,7 @@ SshKeyToken ::= SEQUENCE {
 -- SshKeyToken ::= SEQUENCE {
 --	  token		[0] SshKeyMessage
 --	, cctx		[1] EncCtx		OPTIONAL
---	, sctx		[1] EncCtx		OPTIONAL
+--	, sctx		[2] EncCtx		OPTIONAL
 -- }
 
 END

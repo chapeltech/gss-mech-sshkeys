@@ -1,0 +1,602 @@
+<?xml version="1.0" encoding="US-ASCII"?>
+<rfc version="3"
+     category="exp"
+     consensus="false"
+     submissionType="IETF"
+     ipr="trust200902"
+     docName="draft-dowdeswell-kitten-gss-sshkey-00">
+  <front>
+    <title abbrev="GSS-SSHKEY">
+      The SSH Public-Key GSS-API Mechanism
+    </title>
+    <seriesInfo name="Internet-Draft"
+                value="draft-dowdeswell-kitten-gss-sshkey-00"/>
+    <author initials="R." surname="Dowdeswell"
+            fullname="Roland C. Dowdeswell">
+      <organization/>
+    </author>
+    <date year="2026" month="April" day="29"/>
+    <area>Security</area>
+    <workgroup>Kitten Working Group</workgroup>
+    <keyword>GSS-API</keyword>
+    <keyword>SSH</keyword>
+    <keyword>public key</keyword>
+    <abstract>
+      <t>
+        This document specifies GSS-SSHKEY, a GSS-API security mechanism
+        that establishes a security context using SSH public keys.  The
+        mechanism performs an ephemeral key exchange, authenticates the
+        acceptor with an SSH host key, authenticates the initiator with an
+        SSH user key, and derives per-message keys for GSS-API protection.
+      </t>
+      <t>
+        This is an experimental specification.  The mechanism OID used here
+        is allocated from a private enterprise arc for implementation
+        experiments and is not suitable for final publication.
+      </t>
+    </abstract>
+  </front>
+
+  <middle>
+    <section anchor="requirements">
+      <name>Requirements Language</name>
+      <t>
+        The key words "MUST", "MUST NOT", "REQUIRED", "SHALL",
+        "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED",
+        "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to
+        be interpreted as described in BCP 14 <xref target="RFC2119"/>
+        <xref target="RFC8174"/> when, and only when, they appear in all
+        capitals, as shown here.
+      </t>
+    </section>
+
+    <section anchor="overview">
+      <name>Overview</name>
+      <t>
+        GSS-SSHKEY is a peer authentication and key establishment protocol
+        for the Generic Security Service Application Program Interface
+        (GSS-API) <xref target="RFC2743"/>.  It reuses SSH public-key
+        identities and signature algorithms while presenting the result as
+        an ordinary GSS-API security context.
+      </t>
+      <t>
+        The initiator is the user side of the exchange.  The acceptor is the
+        service or host side.  The acceptor proves possession of a trusted
+        SSH host private key.  After a shared session secret has been
+        derived, the initiator proves possession of an SSH user private key.
+      </t>
+      <t>
+        Context-establishment tokens are DER encodings of the ASN.1
+        SshKeyToken type defined in <xref target="asn1"/>.  Per-message
+        tokens use the GSS-API CFX token framing described in
+        <xref target="RFC4121"/>, with keys derived by this mechanism
+        instead of by Kerberos.
+      </t>
+    </section>
+
+    <section anchor="identity">
+      <name>Mechanism Identity</name>
+      <t>
+        The experimental mechanism OID is:
+      </t>
+      <sourcecode type="text"><![CDATA[
+1.3.6.1.4.1.99999.1
+]]></sourcecode>
+      <t>
+        The corresponding DER OID contents octets are:
+      </t>
+      <sourcecode type="text"><![CDATA[
+2b 06 01 04 01 86 8d 1f 01
+]]></sourcecode>
+      <t>
+        The SASL mechanism name for use by implementations that expose a
+        SASL name is "SSHKEY".
+      </t>
+    </section>
+
+    <section anchor="names">
+      <name>Names and Credentials</name>
+      <t>
+        The target name supplied to gss_init_sec_context() SHOULD be a
+        host-based service name.  The service component identifies the
+        application service, and the host component identifies the SSH host
+        key namespace in which the acceptor key is validated.
+      </t>
+      <t>
+        The acceptor credential consists of one or more SSH host private
+        keys and their public-key metadata.  The initiator credential
+        consists of one or more SSH user private keys and their public-key
+        metadata.
+      </t>
+      <t>
+        An implementation MUST define how trusted acceptor host public keys
+        are found.  A deployment MAY use an SSH known_hosts database, a
+        certificate authority, or another local trust store.  This protocol
+        does not make unauthenticated host keys trustworthy.
+      </t>
+    </section>
+
+    <section anchor="encoding">
+      <name>Token Encoding</name>
+      <t>
+        All context-establishment tokens exchanged by
+        gss_init_sec_context() and gss_accept_sec_context() are DER
+        encodings of SshKeyToken.  Implementations MUST reject tokens that
+        are not valid DER encodings of that type.
+      </t>
+      <t>
+        Algorithm-list fields are OCTET STRING values containing SSH
+        name-lists as defined by <xref target="RFC4251"/>.  Algorithm name
+        fields are OCTET STRING values containing one SSH algorithm name.
+        Signature blobs are encoded as SSH binary strings as used by
+        <xref target="RFC4252"/> and <xref target="RFC4253"/>.
+      </t>
+      <t>
+        Encrypted OCTET STRING fields contain an SSH binary packet with the
+        following fields:
+      </t>
+      <sourcecode type="text"><![CDATA[
+string  enctype
+string  nonce
+string  ciphertext
+]]></sourcecode>
+      <t>
+        For an AEAD enctype, ciphertext includes the authentication tag in
+        the enctype-defined form.  The associated data is the DER encoding
+        of the enclosing SshKeyToken with the encrypted OCTET STRING value
+        replaced by an empty OCTET STRING, followed by the signature
+        transcript fields defined in <xref target="transcript"/>.
+      </t>
+    </section>
+
+    <section anchor="algorithms">
+      <name>Algorithm Negotiation</name>
+      <t>
+        The kextypes, enctypes, and sigtypes fields carry the initiator's
+        supported key-exchange, encryption, and SSH signature algorithms.
+        The acceptor selects one key-exchange and encryption algorithm, and
+        returns its own sigtypes list naming the user signature algorithms it
+        is willing to verify.  The actual host and user signature algorithms
+        are carried in hostauth.sigtype and SshKeyUserAuth.sigtype.
+      </t>
+      <t>
+        SSH public key type and SSH signature type are negotiated separately.
+        This is necessary for RSA, where one ssh-rsa public key can produce
+        rsa-sha2-512, rsa-sha2-256, or legacy ssh-rsa signatures.
+      </t>
+      <t>
+        Implementations of this draft SHOULD support curve25519-sha256 for
+        key exchange, aes256-gcm-sha256 for encrypted fields and
+        per-message tokens, and ssh-ed25519 for signatures.  Curve25519 is
+        described in <xref target="RFC7748"/>.
+      </t>
+      <t>
+        This mechanism is new and has no compatibility requirement for
+        Kerberos DES, Triple-DES, RC4, or other legacy RFC 4121 encryption
+        types.
+      </t>
+    </section>
+
+    <section anchor="transcript">
+      <name>Signature Transcripts and Key Schedule</name>
+      <t>
+        Signature inputs are encoded as SSH strings as defined by
+        <xref target="RFC4251"/>.  In the initiator-first flow, the host
+        signature input is:
+      </t>
+      <sourcecode type="text"><![CDATA[
+SSH-string("gss-sshkey hostauth v1") ||
+SSH-string(mechanism-oid-der-contents) ||
+SSH-string(kex-algorithm) ||
+SSH-string(encryption-algorithm) ||
+SSH-string(initiator-signature-algorithms) ||
+SSH-string(acceptor-signature-algorithms) ||
+SSH-string(initiator-ecdh-public-key) ||
+SSH-string(acceptor-ecdh-public-key) ||
+SSH-string(channel-binding-application-data)
+]]></sourcecode>
+      <t>
+        In the acceptor-first flow, the host challenge signature input is:
+      </t>
+      <sourcecode type="text"><![CDATA[
+SSH-string("gss-sshkey hostchallenge v1") ||
+SSH-string(mechanism-oid-der-contents) ||
+SSH-string(kex-algorithm) ||
+SSH-string(encryption-algorithm) ||
+SSH-string(acceptor-signature-algorithms) ||
+SSH-string(acceptor-ecdh-public-key) ||
+SSH-string(channel-binding-application-data)
+]]></sourcecode>
+      <t>
+        The user signature input is:
+      </t>
+      <sourcecode type="text"><![CDATA[
+SSH-string("gss-sshkey userauth v1") ||
+SSH-string(mechanism-oid-der-contents) ||
+SSH-string(kex-algorithm) ||
+SSH-string(encryption-algorithm) ||
+SSH-string(initiator-signature-algorithms) ||
+SSH-string(acceptor-signature-algorithms) ||
+SSH-string(initiator-ecdh-public-key) ||
+SSH-string(acceptor-ecdh-public-key) ||
+SSH-string(username) ||
+SSH-string(user-public-key-type) ||
+SSH-string(user-public-key-blob) ||
+SSH-string(user-signature-algorithm)
+]]></sourcecode>
+      <t>
+        Let Z be the raw shared secret produced by the selected key exchange.
+        The anonymous ECDH profile derives the base session key with the same
+        SP800-108 HMAC-SHA256 counter-mode KDF inputs as Heimdal
+        SAnon-X25519:
+      </t>
+      <sourcecode type="text"><![CDATA[
+K_base = KDF(
+  K1      = Z,
+  label   = "sanon-x25519",
+  context = initiator-pk || acceptor-pk || uint32(0) ||
+            uint32(flags) || channel-binding-application-data,
+  L       = 128
+)
+]]></sourcecode>
+      <t>
+        This version sends no SAnon-style optional protocol flags, so flags
+        is zero.  Directional per-message keys are derived from K_base using
+        mechanism-specific HMAC-SHA256 labels.  Nonces MUST NOT repeat for a
+        given key and MUST include monotonically increasing sequence numbers.
+      </t>
+    </section>
+
+    <section anchor="flow">
+      <name>Context Establishment</name>
+      <section anchor="initial-token">
+        <name>Initiator KEX Token</name>
+        <t>
+          The first initiator token contains status
+          SSH-KEY-CONTINUE-NEEDED and a SshKeyKEX value.  The kextypes,
+          enctypes, and sigtypes fields contain the initiator algorithm
+          lists.  The kextype, enctype, and pk fields SHOULD contain the
+          initiator's preferred proposal.
+        </t>
+      </section>
+      <section anchor="acceptor-first-token">
+        <name>Acceptor-First KEX Token</name>
+        <t>
+          GSS-API does not require the initiator to generate the first
+          context-establishment token.  If the acceptor is called first with
+          no input token, it sends SSH-KEY-CONTINUE-NEEDED with SshKeyKEX,
+          SshKeyHostAuth, and sctx.  The token contains the acceptor's
+          supported algorithms, preferred key-exchange public value, and a
+          host-key signature over the acceptor-first challenge transcript.
+        </t>
+        <t>
+          The initiator response to an acceptor-first token contains its own
+          SshKeyKEX value, encuserauth when available, and the reflected sctx.
+          The acceptor uses sctx to recover its ephemeral ECDH state, derives
+          the session key, and continues as in the initiator-first exchange.
+        </t>
+      </section>
+      <section anchor="acceptor-token">
+        <name>Acceptor KEX and Host Authentication Token</name>
+        <t>
+          The acceptor validates the proposal, chooses algorithms, computes
+          its key-exchange public value, and returns status
+          SSH-KEY-CONTINUE-NEEDED.  The returned token contains SshKeyKEX
+          with the selected algorithms and acceptor public value, and a
+          SshKeyHostAuth value containing a hostauth signature.
+        </t>
+        <t>
+          The initiator MUST verify the selected algorithms, the host public
+          key trust chain, and hostauth.sig before sending user
+          authentication data.
+        </t>
+      </section>
+      <section anchor="userauth-token">
+        <name>Initiator User Authentication Token</name>
+        <t>
+        The initiator derives the session keys, computes the user
+          signature described in <xref target="transcript"/>, DER encodes
+          SshKeyUserAuth, encrypts it as EncSshKeyUserAuth, and returns a
+          token with encuserauth set.  The initiator MUST also return sctx
+          unchanged when sctx was present in the acceptor token.
+        </t>
+      </section>
+      <section anchor="complete-token">
+        <name>Completion Token</name>
+        <t>
+        The acceptor decrypts encuserauth, validates the SSH user
+          signature, authorizes the requested username, and returns
+          SSH-KEY-COMPLETE.  If the signature algorithm is not acceptable,
+          the acceptor MAY return SSH-KEY-CONTINUE-NEEDED with sctx and a
+          narrower sigtypes list.  If validation or authorization fails, the
+          acceptor returns SSH-KEY-FAILURE.
+        </t>
+        <t>
+          A peer that receives SSH-KEY-FAILURE MUST fail context
+          establishment and MUST discard all state derived from the failed
+          exchange.
+        </t>
+      </section>
+    </section>
+
+    <section anchor="state">
+      <name>Context State Tokens</name>
+      <t>
+        The cctx and sctx fields carry encrypted context state for
+        implementations that need stateless initiator or acceptor operation.
+        cctx is state intended for the initiator.  sctx is state intended
+        for the acceptor.
+      </t>
+      <t>
+        Context state MUST be confidentiality and integrity protected using
+        keys unavailable to the peer that stores or reflects the state.
+        Long-term private keys MUST NOT be stored in cctx or sctx.  Context
+        state SHOULD include the key-exchange transcript values and enough
+        freshness data to prevent replay.
+        For acceptor continuations, sctx MUST contain enough encrypted state
+        for another acceptor process with the same context-protection key to
+        finish authentication.
+      </t>
+      <t>
+        In the acceptor-first flow, sctx contains the acceptor's ephemeral
+        ECDH private key until the initiator returns its public key.  Long-term
+        SSH host or user private keys MUST NOT be stored in sctx.
+      </t>
+    </section>
+
+    <section anchor="per-message">
+      <name>Per-Message Tokens</name>
+      <t>
+        After SSH-KEY-COMPLETE, gss_get_mic(), gss_verify_mic(),
+        gss_wrap(), and gss_unwrap() use CFX token framing
+        <xref target="RFC4121"/>.  K_c2s protects initiator-to-acceptor
+        tokens.  K_s2c protects acceptor-to-initiator tokens.  Sequence
+        numbers start at zero in each direction.  The token framing is from
+        RFC 4121, but the encryption profile is aes256-gcm-sha256 rather
+        than a Kerberos RFC 3961 encryption type.
+      </t>
+      <t>
+        A receiver MUST reject duplicate, reordered, or skipped tokens when
+        the corresponding GSS-API replay or sequence flags were negotiated.
+      </t>
+    </section>
+
+    <section anchor="errors">
+      <name>Error Handling</name>
+      <t>
+        SSH-KEY-FAILURE is a generic protocol failure.  A future version may
+        define structured error codes.  Until then, implementations SHOULD
+        expose local diagnostic details through GSS minor status values
+        rather than placing unauthenticated details on the wire.
+      </t>
+    </section>
+
+    <section anchor="iana">
+      <name>IANA Considerations</name>
+      <t>
+        This -00 draft requests no IANA action.  Before publication as an
+        RFC, the private experimental OID in <xref target="identity"/> must
+        be replaced by a permanent GSS-API mechanism OID from an appropriate
+        arc.
+      </t>
+    </section>
+
+    <section anchor="security">
+      <name>Security Considerations</name>
+      <t>
+        The security of this mechanism depends on correct validation of SSH
+        host public keys and correct authorization of SSH user public keys.
+        Implementations MUST NOT accept unknown host keys merely because
+        they can verify hostauth.sig.
+      </t>
+      <t>
+        Signature inputs bind the algorithm lists, selected algorithms, and
+        key-exchange public values.  Omitting any of these values can permit
+        downgrade or unknown-key-share attacks.
+      </t>
+      <t>
+        EncSshKeyUserAuth hides the username and user signature from passive
+        observers after the ephemeral key exchange.  Implementations MUST
+        verify the acceptor host signature before sending EncSshKeyUserAuth.
+      </t>
+      <t>
+        All encrypted fields require nonce uniqueness.  Reusing a nonce with
+        an AEAD key can reveal plaintext and invalidate authentication.
+      </t>
+      <t>
+        Context state tokens are especially sensitive.  They MUST be
+        integrity protected, SHOULD be bound to the key-exchange transcript
+        values, and SHOULD contain replay protection such as an expiration
+        time or single-use state identifier.
+      </t>
+      <t>
+        This draft intentionally uses a private experimental OID.  Deploying
+        that OID outside controlled experiments risks collision with other
+        private uses.
+      </t>
+    </section>
+
+    <section anchor="implementation-status">
+      <name>Implementation Status</name>
+      <t>
+        The repository associated with this draft currently implements the
+        mechanism loader interface, SAnon-compatible X25519 key derivation,
+        SSH signature blob handling, encrypted acceptor continuation state,
+        client-first and acceptor-first context establishment, RFC 4121-style
+        per-message protection, and smoke tests that prove Heimdal can load
+        the mechanism.  Host key trust policy, ssh-agent signing, and
+        authorized_keys authorization remain implementation work.
+      </t>
+    </section>
+
+    <section anchor="asn1">
+      <name>ASN.1 Module</name>
+      <t>
+        This module is normative for context-establishment token syntax.
+      </t>
+      <sourcecode type="asn.1"><![CDATA[
+SSHKEY DEFINITIONS ::=
+BEGIN
+
+SshKeyCtx ::= SEQUENCE {
+	  user	[0] OCTET STRING	OPTIONAL
+	, key	[1] OCTET STRING	OPTIONAL
+	, h	[2] OCTET STRING	OPTIONAL
+}
+
+EncCtx ::= SEQUENCE {
+	  encPart	[0] OCTET STRING
+}
+
+SshKeyUserAuth ::= SEQUENCE {
+	  username	[0] OCTET STRING
+	, keytype	[1] OCTET STRING
+	, key		[2] OCTET STRING
+	, sigtype	[3] OCTET STRING
+	, sig		[4] OCTET STRING
+}
+
+EncSshKeyUserAuth ::= OCTET STRING
+
+SshKeyHostAuth ::= SEQUENCE {
+	  keytype	[0] OCTET STRING
+	, key		[1] OCTET STRING
+	, sigtype	[2] OCTET STRING
+	, sig		[3] OCTET STRING
+}
+
+SshKeyKEX ::= SEQUENCE {
+	  kextypes	[0] OCTET STRING
+	, enctypes	[1] OCTET STRING
+	, sigtypes	[2] OCTET STRING
+	, kextype	[3] OCTET STRING	OPTIONAL
+	, pk		[4] OCTET STRING	OPTIONAL
+	, enctype	[5] OCTET STRING	OPTIONAL
+}
+
+SshKeyServerContext ::= SEQUENCE {
+	  initiatorPk	[0] OCTET STRING	OPTIONAL
+	, acceptorPk	[1] OCTET STRING
+	, sessionKey	[2] OCTET STRING	OPTIONAL
+	, initiatorSigtypes [3] OCTET STRING	OPTIONAL
+	, acceptorSigtypes [4] OCTET STRING
+	, acceptorSk	[5] OCTET STRING	OPTIONAL
+}
+
+SshKeyStatus ::= INTEGER {
+	  SSH-KEY-COMPLETE		(1)
+	, SSH-KEY-CONTINUE-NEEDED	(2)
+	, SSH-KEY-FAILURE		(3)
+}
+
+SshKeyToken ::= SEQUENCE {
+	  status	[0] SshKeyStatus
+	, kex		[1] SshKeyKEX		OPTIONAL
+	, hostauth	[2] SshKeyHostAuth	OPTIONAL
+	, encuserauth	[3] EncSshKeyUserAuth	OPTIONAL
+	, cctx		[4] EncCtx		OPTIONAL
+	, sctx		[5] EncCtx		OPTIONAL
+}
+
+END
+]]></sourcecode>
+    </section>
+  </middle>
+
+  <back>
+    <references>
+      <name>Normative References</name>
+      <reference anchor="RFC2119"
+                 target="https://www.rfc-editor.org/rfc/rfc2119">
+        <front>
+          <title>
+            Key words for use in RFCs to Indicate Requirement Levels
+          </title>
+          <author initials="S." surname="Bradner"/>
+          <date year="1997" month="March"/>
+        </front>
+        <seriesInfo name="BCP" value="14"/>
+        <seriesInfo name="RFC" value="2119"/>
+      </reference>
+      <reference anchor="RFC8174"
+                 target="https://www.rfc-editor.org/rfc/rfc8174">
+        <front>
+          <title>
+            Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words
+          </title>
+          <author initials="B." surname="Leiba"/>
+          <date year="2017" month="May"/>
+        </front>
+        <seriesInfo name="BCP" value="14"/>
+        <seriesInfo name="RFC" value="8174"/>
+      </reference>
+      <reference anchor="RFC2743"
+                 target="https://www.rfc-editor.org/rfc/rfc2743">
+        <front>
+          <title>
+            Generic Security Service Application Program Interface Version 2,
+            Update 1
+          </title>
+          <author initials="J." surname="Linn"/>
+          <date year="2000" month="January"/>
+        </front>
+        <seriesInfo name="RFC" value="2743"/>
+      </reference>
+      <reference anchor="RFC4121"
+                 target="https://www.rfc-editor.org/rfc/rfc4121">
+        <front>
+          <title>
+            The Kerberos Version 5 Generic Security Service Application
+            Program Interface (GSS-API) Mechanism: Version 2
+          </title>
+          <author initials="L." surname="Zhu"/>
+          <author initials="K." surname="Jaganathan"/>
+          <author initials="S." surname="Hartman"/>
+          <date year="2005" month="July"/>
+        </front>
+        <seriesInfo name="RFC" value="4121"/>
+      </reference>
+      <reference anchor="RFC4251"
+                 target="https://www.rfc-editor.org/rfc/rfc4251">
+        <front>
+          <title>The Secure Shell (SSH) Protocol Architecture</title>
+          <author initials="T." surname="Ylonen"/>
+          <author initials="C." surname="Lonvick"/>
+          <date year="2006" month="January"/>
+        </front>
+        <seriesInfo name="RFC" value="4251"/>
+      </reference>
+      <reference anchor="RFC4252"
+                 target="https://www.rfc-editor.org/rfc/rfc4252">
+        <front>
+          <title>The Secure Shell (SSH) Authentication Protocol</title>
+          <author initials="T." surname="Ylonen"/>
+          <author initials="C." surname="Lonvick"/>
+          <date year="2006" month="January"/>
+        </front>
+        <seriesInfo name="RFC" value="4252"/>
+      </reference>
+      <reference anchor="RFC4253"
+                 target="https://www.rfc-editor.org/rfc/rfc4253">
+        <front>
+          <title>The Secure Shell (SSH) Transport Layer Protocol</title>
+          <author initials="T." surname="Ylonen"/>
+          <author initials="C." surname="Lonvick"/>
+          <date year="2006" month="January"/>
+        </front>
+        <seriesInfo name="RFC" value="4253"/>
+      </reference>
+      <reference anchor="RFC7748"
+                 target="https://www.rfc-editor.org/rfc/rfc7748">
+        <front>
+          <title>Elliptic Curves for Security</title>
+          <author initials="A." surname="Langley"/>
+          <author initials="M." surname="Hamburg"/>
+          <author initials="S." surname="Turner"/>
+          <date year="2016" month="January"/>
+        </front>
+        <seriesInfo name="RFC" value="7748"/>
+      </reference>
+    </references>
+  </back>
+</rfc>

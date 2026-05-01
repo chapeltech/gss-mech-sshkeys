@@ -1,4 +1,9 @@
 *.so
+core
+core.*
+/target/
+/.cargo/
+/.rustup/
 
 /asn1-template.h
 /asn1_sshkey.c
