@@ -31,7 +31,8 @@ Implemented so far:
 - Anonymous X25519 context establishment.
 - A SAnon-X25519-compatible SP800-108 HMAC-SHA256 KDF.
 - SSH signature blob encode, decode, sign, and verify helpers.
-- Optional host-key and user-key signatures from OpenSSH private keys.
+- Acceptor host-key signatures from OpenSSH private keys.
+- Initiator user-key signatures through `ssh-agent`.
 - Encrypted stateless acceptor context returned through `sctx`.
 - Client-first and acceptor-first context establishment.
 - RFC 4121-style per-message wrapping with `gss_wrap`,
@@ -40,7 +41,6 @@ Implemented so far:
 
 Not complete yet:
 
-- `ssh-agent` signing.
 - Client host key trust policy through `known_hosts` and DNSSEC-validated
   SSHFP records.
 - `authorized_keys` lookup and authorization.
@@ -101,15 +101,12 @@ sshkey 1.3.6.1.4.1.99999.1 ../../sshkey.so -
 The OID is a placeholder.  A real deployment needs an assigned OID and an
 installation path appropriate for the host GSS implementation.
 
-Prototype signing configuration is environment-variable based.  This is not
-the final initiator credential model; the intended client-side implementation
-uses `ssh-agent` only, because a GSS mechanism generally cannot interactively
-ask the user for SSH key passphrases.
+Prototype signing configuration is environment-variable based.  The initiator
+uses `SSH_AUTH_SOCK` and asks `ssh-agent` to sign, because a GSS mechanism
+generally cannot interactively ask the user for SSH key passphrases.
 
 - `SSHKEY_HOST_KEY`: OpenSSH private key used by the acceptor to sign its ECDH
   reply.
-- `SSHKEY_USER_KEY`: OpenSSH private key used by the initiator to sign
-  encrypted user authentication in the current prototype only.
 - `SSHKEY_USER`: authorization name signed by the initiator.  Defaults to
   `USER`, then `sshkey`.
 - `SSHKEY_CTX_KEY`: 32-byte hex key used to encrypt acceptor continuation

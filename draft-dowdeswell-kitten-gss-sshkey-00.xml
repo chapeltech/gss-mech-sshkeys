@@ -480,9 +480,8 @@ K_base = KDF(
         client-first and acceptor-first context establishment, RFC 4121-style
         per-message protection, and smoke tests that prove Heimdal can load
         the mechanism.  The implementation has not yet caught up with this
-        draft's finished MAC, SSH-agent-only initiator credential model,
-        SSHFP and known_hosts host-key trust policy, or authorized_keys
-        authorization.
+        draft's finished MAC, SSHFP and known_hosts host-key trust policy, or
+        authorized_keys authorization.
       </t>
     </section>
 

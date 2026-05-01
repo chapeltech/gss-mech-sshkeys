@@ -5,8 +5,10 @@ use core::ffi::c_void;
 use core::ptr;
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use asn1::sshkey::{
     EncCtx, EncSshKeyUserAuth, SshKeyHostAuth, SshKeyKEX,
@@ -142,8 +144,17 @@ const HOSTCHALLENGE_TRANSCRIPT_LABEL: &[u8] =
 const USERAUTH_TRANSCRIPT_LABEL: &[u8] = b"gss-sshkey userauth v1";
 const SSHKEY_CTX_KEY_ENV: &str = "SSHKEY_CTX_KEY";
 const SSHKEY_HOST_KEY_ENV: &str = "SSHKEY_HOST_KEY";
-const SSHKEY_USER_KEY_ENV: &str = "SSHKEY_USER_KEY";
 const SSHKEY_USER_ENV: &str = "SSHKEY_USER";
+const SSH_AGENT_MAX_REPLY_LEN: usize = 16 * 1024 * 1024;
+const SSH_AGENT_TIMEOUT: Duration = Duration::from_secs(5);
+const SSH_AGENT_FAILURE: u8 = 5;
+const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 11;
+const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 12;
+const SSH2_AGENTC_SIGN_REQUEST: u8 = 13;
+const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
+const SSH2_AGENT_FAILURE: u8 = 30;
+const SSH_AGENT_RSA_SHA2_256: u32 = 0x02;
+const SSH_AGENT_RSA_SHA2_512: u32 = 0x04;
 
 #[link(name = "crypto")]
 unsafe extern "C" {
@@ -699,6 +710,29 @@ fn push_ssh_string(out: &mut Vec<u8>, value: &[u8]) -> Option<()> {
     Some(())
 }
 
+fn push_ssh_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_ssh_u32(input: &mut &[u8]) -> Option<u32> {
+    if input.len() < 4 {
+        return None;
+    }
+    let (head, rest) = input.split_at(4);
+    *input = rest;
+    Some(u32::from_be_bytes(head.try_into().ok()?))
+}
+
+fn read_ssh_string(input: &mut &[u8]) -> Option<Vec<u8>> {
+    let len = read_ssh_u32(input)? as usize;
+    if input.len() < len {
+        return None;
+    }
+    let (value, rest) = input.split_at(len);
+    *input = rest;
+    Some(value.to_vec())
+}
+
 fn signature_algorithms(key_alg: &Algorithm) -> Vec<Vec<u8>> {
     match key_alg {
         Algorithm::Ed25519 => vec![b"ssh-ed25519".to_vec()],
@@ -717,6 +751,93 @@ fn signature_algorithms(key_alg: &Algorithm) -> Vec<Vec<u8>> {
         }
         _ => Vec::new(),
     }
+}
+
+fn agent_signature_flags(sigtype: &[u8]) -> u32 {
+    match sigtype {
+        b"rsa-sha2-256" => SSH_AGENT_RSA_SHA2_256,
+        b"rsa-sha2-512" => SSH_AGENT_RSA_SHA2_512,
+        _ => 0,
+    }
+}
+
+struct AgentIdentity {
+    key: Vec<u8>,
+    public_key: PublicKey,
+}
+
+fn parse_agent_identities(mut payload: &[u8]) -> Option<Vec<AgentIdentity>> {
+    if payload.first().copied()? != SSH2_AGENT_IDENTITIES_ANSWER {
+        return None;
+    }
+    payload = &payload[1..];
+    let count = read_ssh_u32(&mut payload)?;
+    if count > 1024 {
+        return None;
+    }
+
+    let mut identities = Vec::new();
+    for _ in 0..count {
+        let key = read_ssh_string(&mut payload)?;
+        let _comment = read_ssh_string(&mut payload)?;
+        let public_key = PublicKey::from_bytes(&key).ok()?;
+        identities.push(AgentIdentity { key, public_key });
+    }
+    if !payload.is_empty() {
+        return None;
+    }
+    Some(identities)
+}
+
+fn agent_request(payload: &[u8]) -> Option<Vec<u8>> {
+    let path = env::var_os("SSH_AUTH_SOCK")?;
+    let mut stream = UnixStream::connect(path).ok()?;
+    stream.set_read_timeout(Some(SSH_AGENT_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(SSH_AGENT_TIMEOUT)).ok()?;
+
+    let len: u32 = payload.len().try_into().ok()?;
+    stream.write_all(&len.to_be_bytes()).ok()?;
+    stream.write_all(payload).ok()?;
+
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).ok()?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len == 0 || len > SSH_AGENT_MAX_REPLY_LEN {
+        return None;
+    }
+    let mut reply = vec![0u8; len];
+    stream.read_exact(&mut reply).ok()?;
+    if matches!(
+        reply.first().copied(),
+        Some(SSH_AGENT_FAILURE | SSH2_AGENT_FAILURE)
+    ) {
+        return None;
+    }
+    Some(reply)
+}
+
+fn agent_identities() -> Option<Vec<AgentIdentity>> {
+    let reply = agent_request(&[SSH2_AGENTC_REQUEST_IDENTITIES])?;
+    parse_agent_identities(&reply)
+}
+
+fn agent_sign(key: &[u8], data: &[u8], sigtype: &[u8]) -> Option<Vec<u8>> {
+    let mut request = vec![SSH2_AGENTC_SIGN_REQUEST];
+    push_ssh_string(&mut request, key)?;
+    push_ssh_string(&mut request, data)?;
+    push_ssh_u32(&mut request, agent_signature_flags(sigtype));
+
+    let mut reply = agent_request(&request)?;
+    if reply.first().copied()? != SSH2_AGENT_SIGN_RESPONSE {
+        return None;
+    }
+    reply = reply.split_off(1);
+    let mut body = reply.as_slice();
+    let signature = read_ssh_string(&mut body)?;
+    if !body.is_empty() {
+        return None;
+    }
+    Some(signature)
 }
 
 fn alg_list_contains(list: &[u8], alg: &[u8]) -> bool {
@@ -937,50 +1058,56 @@ unsafe fn encrypted_userauth(
     initiator_public: &[u8; X25519_PUBLIC_LEN],
     acceptor_public: &[u8; X25519_PUBLIC_LEN],
 ) -> Option<EncSshKeyUserAuth> {
-    let private_key = read_private_key_from_env(SSHKEY_USER_KEY_ENV)?;
     let username = env::var(SSHKEY_USER_ENV)
         .or_else(|_| env::var("USER"))
         .unwrap_or_else(|_| "sshkey".to_string())
         .into_bytes();
-    let public_key = private_key.public_key();
-    let keytype = public_key.algorithm().as_str().as_bytes().to_vec();
-    let key = public_key.to_bytes().ok()?;
-    let sigtype = signature_algorithms(&private_key.algorithm())
-        .into_iter()
-        .find(|alg| alg_list_contains(acceptor_sigtypes, alg))
-        .unwrap_or_else(|| keytype.clone());
-    let input = user_signature_input(
-        initiator_sigtypes,
-        acceptor_sigtypes,
-        initiator_public,
-        acceptor_public,
-        &username,
-        &keytype,
-        &key,
-        &sigtype,
-    )?;
-    let (_, _, actual_sigtype, _) = sign_ssh_data(&private_key, &input)?;
-    let input = user_signature_input(
-        initiator_sigtypes,
-        acceptor_sigtypes,
-        initiator_public,
-        acceptor_public,
-        &username,
-        &keytype,
-        &key,
-        &actual_sigtype,
-    )?;
-    let (_, _, sigtype, sig) = sign_ssh_data(&private_key, &input)?;
-    let userauth = SshKeyUserAuth::new(
-        OctetString::from(username),
-        OctetString::from(keytype),
-        OctetString::from(key),
-        OctetString::from(sigtype),
-        OctetString::from(sig),
-    );
-    let plaintext = rasn::der::encode(&userauth).ok()?;
-    let ciphertext = seal_userauth(session_key, &plaintext)?;
-    Some(EncSshKeyUserAuth(OctetString::from(ciphertext)))
+    for identity in agent_identities()? {
+        let key_alg = identity.public_key.algorithm();
+        let keytype = key_alg.as_str().as_bytes().to_vec();
+        for sigtype in signature_algorithms(&key_alg) {
+            if !alg_list_contains(initiator_sigtypes, &sigtype)
+                || !alg_list_contains(acceptor_sigtypes, &sigtype)
+            {
+                continue;
+            }
+            let input = user_signature_input(
+                initiator_sigtypes,
+                acceptor_sigtypes,
+                initiator_public,
+                acceptor_public,
+                &username,
+                &keytype,
+                &identity.key,
+                &sigtype,
+            )?;
+            let sig = agent_sign(&identity.key, &input, &sigtype)?;
+            let signature = SshSignature::try_from(sig.as_slice()).ok()?;
+            if signature.algorithm().as_str().as_bytes() != sigtype {
+                continue;
+            }
+            if !verify_ssh_signature(
+                &identity.key,
+                &sigtype,
+                &sig,
+                &input,
+            ) {
+                continue;
+            }
+
+            let userauth = SshKeyUserAuth::new(
+                OctetString::from(username),
+                OctetString::from(keytype),
+                OctetString::from(identity.key),
+                OctetString::from(sigtype),
+                OctetString::from(sig),
+            );
+            let plaintext = rasn::der::encode(&userauth).ok()?;
+            let ciphertext = seal_userauth(session_key, &plaintext)?;
+            return Some(EncSshKeyUserAuth(OctetString::from(ciphertext)));
+        }
+    }
+    None
 }
 
 fn hostauth_token(
@@ -3692,6 +3819,29 @@ mod tests {
 
         *sig.last_mut().unwrap() ^= 0x01;
         assert!(!verify_ssh_signature(&key, &sigtype, &sig, input));
+    }
+
+    #[test]
+    fn agent_identity_parser_reads_public_keys() {
+        let private_key = ed25519_private_key();
+        let key = private_key.public_key().to_bytes().unwrap();
+        let mut payload = vec![SSH2_AGENT_IDENTITIES_ANSWER];
+
+        push_ssh_u32(&mut payload, 1);
+        push_ssh_string(&mut payload, &key).unwrap();
+        push_ssh_string(&mut payload, b"user@example.com").unwrap();
+
+        let identities = parse_agent_identities(&payload).unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].key, key);
+        assert_eq!(identities[0].public_key.algorithm(), Algorithm::Ed25519);
+    }
+
+    #[test]
+    fn agent_signature_flags_match_openssh_rsa_values() {
+        assert_eq!(agent_signature_flags(b"rsa-sha2-256"), 0x02);
+        assert_eq!(agent_signature_flags(b"rsa-sha2-512"), 0x04);
+        assert_eq!(agent_signature_flags(b"ssh-ed25519"), 0);
     }
 
     #[test]
