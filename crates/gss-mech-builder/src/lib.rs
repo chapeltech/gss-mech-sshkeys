@@ -4,6 +4,8 @@
 use core::ffi::c_void;
 use core::ptr;
 
+pub mod signed_ecdh;
+
 pub mod sys {
     use super::c_void;
 

@@ -27,6 +27,9 @@ publication.  Any protocol-affecting implementation change must update both.
 - Finish the first reusable `rfc4121` crate slice.  The crate now owns wrap
   and MIC token framing, split-token size planning, and the
   `aes256-gcm-sha256` profile used by this mechanism.
+- Add the signed-ECDH builder API scaffold.  The builder now has canonical
+  auth and Finished transcripts, signer/verifier traits, ECDH hooks, and
+  continuation-state and key-confirmation traits for higher-level mechanisms.
 
 ## Next Steps
 
@@ -48,8 +51,9 @@ publication.  Any protocol-affecting implementation change must update both.
      handoff to the RFC4121 backend.  The mechanism author supplies identity,
      signing, verification, host trust, and initiator authorization callbacks.
 
-   Add the remaining common exports, then add the higher-level signed-ECDH API
-   under a separate module so simpler mechanisms can keep using lower layers.
+   Add the remaining common exports, then move this mechanism's current
+   signed-ECDH handshake onto the new builder module without hiding the lower
+   layers from simpler mechanisms.
 
 2. Add `authorized_keys` authorization.
 

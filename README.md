@@ -38,20 +38,19 @@ Implemented so far:
 - Finished MAC key confirmation over the ECDH-derived session key.
 - Encrypted stateless acceptor context returned through `sctx`.
 - Client-first and acceptor-first context establishment.
-- Initial reusable `rfc4121` crate for token framing and sequence handling.
-- Initial `gss-mech-builder` crate for GSS ABI definitions and RFC4121
-  per-message scaffolding.
+- Reusable `rfc4121` crate for wrap and MIC token framing, sequence handling,
+  split-token size planning, and the `aes256-gcm-sha256` profile.
+- Initial `gss-mech-builder` crate for GSS ABI definitions, RFC4121
+  per-message scaffolding, and signed-ECDH handshake scaffolding.
 - RFC 4121-style per-message wrapping with `gss_wrap`,
   `gss_unwrap`, `gss_wrap_iov`, and `gss_unwrap_iov`.
+- RFC 4121-style MICs with `gss_get_mic` and `gss_verify_mic`.
 - Smoke tests using `/usr/local/bin/gss-token`.
 
 Not complete yet:
 
 - `authorized_keys` lookup and authorization.
-- Completing `rfc4121` with MIC tokens, IOV planning, and a reusable
-  aes256-gcm-sha256 profile.
-- Integrating `gss-mech-builder` into this mechanism and expanding it beyond
-  per-message entrypoints.
+- Moving the current signed-ECDH handshake onto the new builder layer.
 - Production OID assignment and packaged installation.
 
 Without a configured user key, the mechanism still completes anonymously and

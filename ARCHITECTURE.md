@@ -22,7 +22,10 @@ Generated ASN.1 files are build artifacts and must not be committed.
 
 The current crypto implementation is mixed:
 
-- OpenSSL FFI is still used for X25519, HMAC-SHA256, and AES-256-GCM.
+- OpenSSL FFI is still used for X25519, handshake KDF/MAC helpers, and
+  encrypted acceptor continuation state.
+- The `rfc4121` crate uses RustCrypto `aes-gcm`, `hmac`, and `sha2` for
+  RFC4121-style per-message services.
 - The `ssh-key` and `signature` crates are used for SSH public key and
   signature blob handling.
 
@@ -68,6 +71,9 @@ is tested through Heimdal loading.  The acceptor-first path is tested by direct
 ## Source Map
 
 - `src/lib.rs`: mechanism implementation.
+- `crates/rfc4121/`: reusable RFC4121-style per-message tokens and crypto.
+- `crates/gss-mech-builder/`: GSS ABI helpers, RFC4121 entrypoint helpers, and
+  signed-ECDH mechanism scaffolding.
 - `sshkey.asn1`: ASN.1 schema and inline protocol notes.
 - `draft-dowdeswell-kitten-gss-sshkey-00.xml`: normative protocol draft.
 - `build.rs`: ASN.1 generation through `rasn-compiler`.
