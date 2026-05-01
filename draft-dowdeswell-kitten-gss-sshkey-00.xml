@@ -480,7 +480,7 @@ K_base = KDF(
         client-first and acceptor-first context establishment, RFC 4121-style
         per-message protection, and smoke tests that prove Heimdal can load
         the mechanism.  The implementation has not yet caught up with this
-        draft's finished MAC or authorized_keys authorization.
+        draft's authorized_keys authorization.
       </t>
     </section>
 
@@ -541,6 +541,8 @@ SshKeyServerContext ::= SEQUENCE {
 	, initiatorSigtypes [3] OCTET STRING	OPTIONAL
 	, acceptorSigtypes [4] OCTET STRING
 	, acceptorSk	[5] OCTET STRING	OPTIONAL
+	, initiatorNonce [6] OCTET STRING	OPTIONAL
+	, acceptorNonce [7] OCTET STRING
 }
 
 SshKeyStatus ::= INTEGER {

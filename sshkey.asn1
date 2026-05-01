@@ -127,7 +127,8 @@ SshKeyFinished ::= SEQUENCE {
 -- SshKeyServerContext is DER encoded and encrypted into SshKeyToken.sctx.
 -- The client must return sctx unchanged with any continuation token so another
 -- acceptor process with the same context-protection key can finish the
--- authentication.
+-- authentication.  The nonces are retained here so a stateless acceptor can
+-- verify SshKeyFinished when the initiator returns.
 
 SshKeyServerContext ::= SEQUENCE {
 	  initiatorPk	[0] OCTET STRING	OPTIONAL
@@ -136,6 +137,8 @@ SshKeyServerContext ::= SEQUENCE {
 	, initiatorSigtypes [3] OCTET STRING	OPTIONAL
 	, acceptorSigtypes [4] OCTET STRING
 	, acceptorSk	[5] OCTET STRING	OPTIONAL
+	, initiatorNonce [6] OCTET STRING	OPTIONAL
+	, acceptorNonce [7] OCTET STRING
 }
 
 --

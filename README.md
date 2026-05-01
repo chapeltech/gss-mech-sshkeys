@@ -35,6 +35,7 @@ Implemented so far:
 - Initiator user-key signatures through `ssh-agent`.
 - Client host-key trust through OpenSSH `known_hosts` files and
   DNSSEC-validated SSHFP records.
+- Finished MAC key confirmation over the ECDH-derived session key.
 - Encrypted stateless acceptor context returned through `sctx`.
 - Client-first and acceptor-first context establishment.
 - RFC 4121-style per-message wrapping with `gss_wrap`,
@@ -44,7 +45,6 @@ Implemented so far:
 Not complete yet:
 
 - `authorized_keys` lookup and authorization.
-- Finished MAC key confirmation from the current draft.
 - Production OID assignment and packaged installation.
 
 Without a configured user key, the mechanism still completes anonymously and

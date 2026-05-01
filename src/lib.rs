@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use asn1::sshkey::{
     EncCtx, EncSshKeyUserAuth, SshKeyHostAuth, SshKeyKEX,
-    SshKeyServerContext, SshKeyStatus, SshKeyToken, SshKeyUserAuth,
+    SshKeyFinished, SshKeyServerContext, SshKeyStatus, SshKeyToken,
+    SshKeyUserAuth,
 };
 use hmac::{Hmac, Mac};
 use rasn::types::{Integer, OctetString};
@@ -142,8 +143,12 @@ const CFX_FILLER: u8 = 0xff;
 const CFX_HMAC_LEN: usize = 32;
 const CFX_GCM_TAG_LEN: usize = 16;
 const CFX_GCM_NONCE_LEN: usize = 12;
+const HANDSHAKE_NONCE_LEN: usize = 32;
 const SERVER_CONTEXT_LABEL: &[u8] = b"SSHKEY server context v1";
 const USERAUTH_LABEL: &[u8] = b"SSHKEY userauth v1";
+const FINISHED_KEY_LABEL: &[u8] = b"SSHKEY finished key v1";
+const INITIATOR_FINISHED_LABEL: &[u8] = b"gss-sshkey initiator finished v1";
+const ACCEPTOR_FINISHED_LABEL: &[u8] = b"gss-sshkey acceptor finished v1";
 const HOSTAUTH_TRANSCRIPT_LABEL: &[u8] = b"gss-sshkey hostauth v1";
 const HOSTCHALLENGE_TRANSCRIPT_LABEL: &[u8] =
     b"gss-sshkey hostchallenge v1";
@@ -342,6 +347,8 @@ struct SshKeyCtx {
     server_context: Option<Vec<u8>>,
     display_name: Vec<u8>,
     target_host: Option<String>,
+    initiator_nonce: Option<Vec<u8>>,
+    acceptor_nonce: Option<Vec<u8>>,
     authenticated: bool,
     send_seq: u64,
     recv_seq: u64,
@@ -361,6 +368,8 @@ impl SshKeyCtx {
             server_context: None,
             display_name: b"sshkey".to_vec(),
             target_host: None,
+            initiator_nonce: None,
+            acceptor_nonce: None,
             authenticated: false,
             send_seq: 0,
             recv_seq: 0,
@@ -605,8 +614,22 @@ fn kex_public_key(kex: &SshKeyKEX) -> Option<[u8; X25519_PUBLIC_LEN]> {
     public.as_ref().try_into().ok()
 }
 
+fn kex_nonce(kex: &SshKeyKEX) -> Option<Vec<u8>> {
+    let nonce = kex.nonce.as_ref()?;
+    if nonce.as_ref().len() != HANDSHAKE_NONCE_LEN {
+        return None;
+    }
+    Some(nonce.as_ref().to_vec())
+}
+
+fn generate_handshake_nonce() -> Option<Vec<u8>> {
+    let mut nonce = vec![0u8; HANDSHAKE_NONCE_LEN];
+    fill_random(&mut nonce).then_some(nonce)
+}
+
 fn initial_context_token(
     public_key: &[u8; X25519_PUBLIC_LEN],
+    nonce: &[u8],
 ) -> Result<Vec<u8>, rasn::error::EncodeError> {
     let kex = SshKeyKEX::new(
         OctetString::from_static(KEX_ALG),
@@ -615,7 +638,7 @@ fn initial_context_token(
         Some(OctetString::from_static(KEX_ALG)),
         Some(OctetString::from(public_key.as_slice())),
         Some(OctetString::from_static(ENC_ALG)),
-        None,
+        Some(OctetString::from(nonce)),
     );
     let token = SshKeyToken::new(
         token_status(SSH_KEY_CONTINUE_NEEDED),
@@ -635,6 +658,8 @@ fn acceptor_context_token(
     acceptor_sigtypes: &[u8],
     hostauth: Option<SshKeyHostAuth>,
     sctx: EncCtx,
+    nonce: &[u8],
+    finished: Option<SshKeyFinished>,
 ) -> Result<Vec<u8>, rasn::error::EncodeError> {
     let kex = SshKeyKEX::new(
         OctetString::from_static(KEX_ALG),
@@ -643,7 +668,7 @@ fn acceptor_context_token(
         Some(OctetString::from_static(KEX_ALG)),
         Some(OctetString::from(public_key.as_slice())),
         Some(OctetString::from_static(ENC_ALG)),
-        None,
+        Some(OctetString::from(nonce)),
     );
     let token = SshKeyToken::new(
         token_status(SSH_KEY_CONTINUE_NEEDED),
@@ -652,7 +677,7 @@ fn acceptor_context_token(
         None,
         None,
         Some(sctx),
-        None,
+        finished,
     );
 
     rasn::der::encode(&token)
@@ -662,6 +687,7 @@ fn initiator_final_token(
     kex: Option<SshKeyKEX>,
     encuserauth: Option<EncSshKeyUserAuth>,
     sctx: EncCtx,
+    finished: SshKeyFinished,
 ) -> Result<Vec<u8>, rasn::error::EncodeError> {
     let token = SshKeyToken::new(
         token_status(SSH_KEY_COMPLETE),
@@ -670,7 +696,7 @@ fn initiator_final_token(
         encuserauth,
         None,
         Some(sctx),
-        None,
+        Some(finished),
     );
 
     rasn::der::encode(&token)
@@ -1286,6 +1312,68 @@ fn user_signature_input(
     push_ssh_string(&mut out, key)?;
     push_ssh_string(&mut out, sigtype)?;
     Some(out)
+}
+
+fn handshake_transcript_hash(
+    initiator_sigtypes: &[u8],
+    acceptor_sigtypes: &[u8],
+    initiator_public: &[u8; X25519_PUBLIC_LEN],
+    acceptor_public: &[u8; X25519_PUBLIC_LEN],
+    initiator_nonce: &[u8],
+    acceptor_nonce: &[u8],
+    channel_bindings: &[u8],
+) -> Option<[u8; 32]> {
+    let mut input = Vec::new();
+    push_ssh_string(&mut input, &SSHKEY_OID_ELEMENTS)?;
+    push_ssh_string(&mut input, KEX_ALG)?;
+    push_ssh_string(&mut input, ENC_ALG)?;
+    push_ssh_string(&mut input, initiator_sigtypes)?;
+    push_ssh_string(&mut input, acceptor_sigtypes)?;
+    push_ssh_string(&mut input, initiator_public)?;
+    push_ssh_string(&mut input, acceptor_public)?;
+    push_ssh_string(&mut input, initiator_nonce)?;
+    push_ssh_string(&mut input, acceptor_nonce)?;
+    push_ssh_string(&mut input, channel_bindings)?;
+    Some(Sha256::digest(input).into())
+}
+
+unsafe fn finished_mac(
+    session_key: &[u8; SANON_SESSION_KEY_LEN],
+    label: &[u8],
+    transcript_hash: &[u8; 32],
+    peer_nonce: &[u8],
+) -> Option<Vec<u8>> {
+    let finished_key = hmac_sha256(session_key, FINISHED_KEY_LABEL)?;
+    let mut input = Vec::new();
+    push_ssh_string(&mut input, label)?;
+    push_ssh_string(&mut input, transcript_hash)?;
+    push_ssh_string(&mut input, peer_nonce)?;
+    Some(hmac_sha256(&finished_key, &input)?.to_vec())
+}
+
+unsafe fn make_finished(
+    session_key: &[u8; SANON_SESSION_KEY_LEN],
+    label: &[u8],
+    transcript_hash: &[u8; 32],
+    peer_nonce: &[u8],
+) -> Option<SshKeyFinished> {
+    let mac = finished_mac(session_key, label, transcript_hash, peer_nonce)?;
+    Some(SshKeyFinished::new(OctetString::from(mac)))
+}
+
+unsafe fn verify_finished(
+    finished: &SshKeyFinished,
+    session_key: &[u8; SANON_SESSION_KEY_LEN],
+    label: &[u8],
+    transcript_hash: &[u8; 32],
+    peer_nonce: &[u8],
+) -> bool {
+    let Some(expected) =
+        finished_mac(session_key, label, transcript_hash, peer_nonce)
+    else {
+        return false;
+    };
+    finished.mac.as_ref() == expected.as_slice()
 }
 
 fn read_private_key_from_env(name: &str) -> Option<PrivateKey> {
@@ -2928,6 +3016,10 @@ pub unsafe extern "C" fn gss_init_sec_context(
             set_minor(minor, EINVAL);
             return GSS_S_DEFECTIVE_TOKEN;
         };
+        let Some(acceptor_nonce) = kex_nonce(kex) else {
+            set_minor(minor, EINVAL);
+            return GSS_S_DEFECTIVE_TOKEN;
+        };
         let server_first = ctx.public_key.is_none() || ctx.ecdh_key.is_none();
         if server_first {
             let Some((private_key, public_key)) = generate_x25519_keypair()
@@ -2935,11 +3027,20 @@ pub unsafe extern "C" fn gss_init_sec_context(
                 set_minor(minor, EINVAL);
                 return GSS_S_FAILURE;
             };
+            let Some(nonce) = generate_handshake_nonce() else {
+                set_minor(minor, EINVAL);
+                return GSS_S_FAILURE;
+            };
             ctx.ecdh_key = Some(private_key);
             ctx.public_key = Some(public_key);
             ctx.initiator_sigtypes = SIG_ALGS.to_vec();
+            ctx.initiator_nonce = Some(nonce);
         }
         let initiator_public = ctx.public_key.unwrap();
+        let Some(initiator_nonce) = ctx.initiator_nonce.clone() else {
+            set_minor(minor, EINVAL);
+            return GSS_S_FAILURE;
+        };
         let private_key = ctx.ecdh_key.as_ref().unwrap();
         let Some(shared) = x25519_shared_secret(private_key, &acceptor_public)
         else {
@@ -2966,6 +3067,18 @@ pub unsafe extern "C" fn gss_init_sec_context(
         };
         let acceptor_sigtypes = kex.sigtypes.as_ref().to_vec();
         let initiator_sigtypes = ctx.initiator_sigtypes.clone();
+        let Some(transcript_hash) = handshake_transcript_hash(
+            &initiator_sigtypes,
+            &acceptor_sigtypes,
+            &initiator_public,
+            &acceptor_public,
+            &initiator_nonce,
+            &acceptor_nonce,
+            &channel_bindings,
+        ) else {
+            set_minor(minor, EINVAL);
+            return GSS_S_FAILURE;
+        };
 
         if let Some(hostauth) = token.hostauth.as_ref() {
             let input = if server_first {
@@ -3005,6 +3118,22 @@ pub unsafe extern "C" fn gss_init_sec_context(
                 return GSS_S_BAD_SIG;
             }
         }
+        if !server_first {
+            let Some(finished) = token.finished.as_ref() else {
+                set_minor(minor, EINVAL);
+                return GSS_S_DEFECTIVE_TOKEN;
+            };
+            if !verify_finished(
+                finished,
+                &session_key,
+                ACCEPTOR_FINISHED_LABEL,
+                &transcript_hash,
+                &initiator_nonce,
+            ) {
+                set_minor(minor, EINVAL);
+                return GSS_S_BAD_SIG;
+            }
+        }
         let Some(sctx) = token.sctx.as_ref() else {
             set_minor(minor, EINVAL);
             return GSS_S_DEFECTIVE_TOKEN;
@@ -3023,6 +3152,7 @@ pub unsafe extern "C" fn gss_init_sec_context(
         ctx.ecdh_key = None;
         ctx.acceptor_sigtypes = acceptor_sigtypes;
         ctx.server_context = Some(server_context.clone());
+        ctx.acceptor_nonce = Some(acceptor_nonce.clone());
         ctx.authenticated = encuserauth.is_some();
         ctx.send_seq = 0;
         ctx.recv_seq = 0;
@@ -3036,10 +3166,19 @@ pub unsafe extern "C" fn gss_init_sec_context(
                 Some(OctetString::from_static(KEX_ALG)),
                 Some(OctetString::from(initiator_public.as_slice())),
                 Some(OctetString::from_static(ENC_ALG)),
-                None,
+                Some(OctetString::from(initiator_nonce.as_slice())),
             ))
         } else {
             None
+        };
+        let Some(finished) = make_finished(
+            &session_key,
+            INITIATOR_FINISHED_LABEL,
+            &transcript_hash,
+            &acceptor_nonce,
+        ) else {
+            set_minor(minor, EINVAL);
+            return GSS_S_FAILURE;
         };
         let ret = encode_output_token(
             minor,
@@ -3048,6 +3187,7 @@ pub unsafe extern "C" fn gss_init_sec_context(
                 response_kex,
                 encuserauth,
                 EncCtx::new(OctetString::from(server_context)),
+                finished,
             ),
         );
         if ret != GSS_S_COMPLETE {
@@ -3064,6 +3204,10 @@ pub unsafe extern "C" fn gss_init_sec_context(
         set_minor(minor, EINVAL);
         return GSS_S_FAILURE;
     };
+    let Some(nonce) = generate_handshake_nonce() else {
+        set_minor(minor, EINVAL);
+        return GSS_S_FAILURE;
+    };
     ctx.ecdh_key = Some(private_key);
     ctx.public_key = Some(public_key);
     ctx.peer_public_key = None;
@@ -3071,6 +3215,8 @@ pub unsafe extern "C" fn gss_init_sec_context(
     ctx.initiator_sigtypes = SIG_ALGS.to_vec();
     ctx.acceptor_sigtypes = SIG_ALGS.to_vec();
     ctx.server_context = None;
+    ctx.initiator_nonce = Some(nonce.clone());
+    ctx.acceptor_nonce = None;
     ctx.authenticated = false;
     ctx.send_seq = 0;
     ctx.recv_seq = 0;
@@ -3079,7 +3225,7 @@ pub unsafe extern "C" fn gss_init_sec_context(
     let ret = encode_output_token(
         minor,
         output_token,
-        initial_context_token(&public_key),
+        initial_context_token(&public_key, &nonce),
     );
     if ret != GSS_S_COMPLETE {
         return ret;
@@ -3122,6 +3268,10 @@ pub unsafe extern "C" fn gss_accept_sec_context(
             set_minor(minor, EINVAL);
             return GSS_S_FAILURE;
         };
+        let Some(acceptor_nonce) = generate_handshake_nonce() else {
+            set_minor(minor, EINVAL);
+            return GSS_S_FAILURE;
+        };
         let channel_bindings = match channel_binding_application_data(bindings)
         {
             Ok(channel_bindings) => channel_bindings,
@@ -3138,6 +3288,8 @@ pub unsafe extern "C" fn gss_accept_sec_context(
             None,
             OctetString::from(acceptor_sigtypes.as_slice()),
             Some(OctetString::from(acceptor_private.as_slice())),
+            None,
+            OctetString::from(acceptor_nonce.as_slice()),
         );
         let Some(sealed_sctx) = seal_server_context(&server_context) else {
             set_minor(minor, EINVAL);
@@ -3162,6 +3314,8 @@ pub unsafe extern "C" fn gss_accept_sec_context(
             ctx.session_key = None;
             ctx.acceptor_sigtypes = acceptor_sigtypes.clone();
             ctx.server_context = Some(sealed_sctx);
+            ctx.initiator_nonce = None;
+            ctx.acceptor_nonce = Some(acceptor_nonce.clone());
             ctx.authenticated = false;
             ctx.send_seq = 0;
             ctx.recv_seq = 0;
@@ -3179,6 +3333,8 @@ pub unsafe extern "C" fn gss_accept_sec_context(
                 &acceptor_sigtypes,
                 hostauth,
                 sctx,
+                &acceptor_nonce,
+                None,
             ),
         );
         if ret != GSS_S_COMPLETE {
@@ -3206,8 +3362,16 @@ pub unsafe extern "C" fn gss_accept_sec_context(
             set_minor(minor, EINVAL);
             return GSS_S_DEFECTIVE_TOKEN;
         };
+        let Some(initiator_nonce) = kex_nonce(kex) else {
+            set_minor(minor, EINVAL);
+            return GSS_S_DEFECTIVE_TOKEN;
+        };
         let Some((private_key, acceptor_public)) = generate_x25519_keypair()
         else {
+            set_minor(minor, EINVAL);
+            return GSS_S_FAILURE;
+        };
+        let Some(acceptor_nonce) = generate_handshake_nonce() else {
             set_minor(minor, EINVAL);
             return GSS_S_FAILURE;
         };
@@ -3237,6 +3401,27 @@ pub unsafe extern "C" fn gss_accept_sec_context(
         };
         let initiator_sigtypes = kex.sigtypes.as_ref().to_vec();
         let acceptor_sigtypes = SIG_ALGS.to_vec();
+        let Some(transcript_hash) = handshake_transcript_hash(
+            &initiator_sigtypes,
+            &acceptor_sigtypes,
+            &initiator_public,
+            &acceptor_public,
+            &initiator_nonce,
+            &acceptor_nonce,
+            &channel_bindings,
+        ) else {
+            set_minor(minor, EINVAL);
+            return GSS_S_FAILURE;
+        };
+        let Some(finished) = make_finished(
+            &session_key,
+            ACCEPTOR_FINISHED_LABEL,
+            &transcript_hash,
+            &initiator_nonce,
+        ) else {
+            set_minor(minor, EINVAL);
+            return GSS_S_FAILURE;
+        };
         let server_context = SshKeyServerContext::new(
             Some(OctetString::from(initiator_public.as_slice())),
             OctetString::from(acceptor_public.as_slice()),
@@ -3244,6 +3429,8 @@ pub unsafe extern "C" fn gss_accept_sec_context(
             Some(OctetString::from(initiator_sigtypes.as_slice())),
             OctetString::from(acceptor_sigtypes.as_slice()),
             None,
+            Some(OctetString::from(initiator_nonce.as_slice())),
+            OctetString::from(acceptor_nonce.as_slice()),
         );
         let Some(sealed_sctx) = seal_server_context(&server_context) else {
             set_minor(minor, EINVAL);
@@ -3271,6 +3458,8 @@ pub unsafe extern "C" fn gss_accept_sec_context(
             ctx.acceptor_sigtypes = acceptor_sigtypes.clone();
             ctx.server_context = Some(sealed_sctx);
             ctx.ecdh_key = None;
+            ctx.initiator_nonce = Some(initiator_nonce.clone());
+            ctx.acceptor_nonce = Some(acceptor_nonce.clone());
             ctx.authenticated = false;
             ctx.send_seq = 0;
             ctx.recv_seq = 0;
@@ -3291,6 +3480,8 @@ pub unsafe extern "C" fn gss_accept_sec_context(
                 &acceptor_sigtypes,
                 hostauth,
                 sctx,
+                &acceptor_nonce,
+                Some(finished),
             ),
         );
         if ret != GSS_S_COMPLETE {
@@ -3337,6 +3528,32 @@ pub unsafe extern "C" fn gss_accept_sec_context(
         };
         public
     };
+    let initiator_nonce = if let Some(value) =
+        server_context.initiator_nonce.as_ref()
+    {
+        value.as_ref().to_vec()
+    } else if let Some(kex) = token.kex.as_ref() {
+        let Some(nonce) = kex_nonce(kex) else {
+            set_minor(minor, EINVAL);
+            return GSS_S_DEFECTIVE_TOKEN;
+        };
+        nonce
+    } else {
+        set_minor(minor, EINVAL);
+        return GSS_S_DEFECTIVE_TOKEN;
+    };
+    let acceptor_nonce = server_context.acceptor_nonce.as_ref().to_vec();
+    if acceptor_nonce.len() != HANDSHAKE_NONCE_LEN {
+        set_minor(minor, EINVAL);
+        return GSS_S_DEFECTIVE_TOKEN;
+    }
+    let channel_bindings = match channel_binding_application_data(bindings) {
+        Ok(channel_bindings) => channel_bindings,
+        Err(major) => {
+            set_minor(minor, EINVAL);
+            return major;
+        }
+    };
     let session_key = if let Some(value) = server_context.session_key.as_ref()
     {
         let Some(session_key) = value.as_ref().try_into().ok() else {
@@ -3364,14 +3581,6 @@ pub unsafe extern "C" fn gss_accept_sec_context(
             set_minor(minor, EINVAL);
             return GSS_S_FAILURE;
         };
-        let channel_bindings = match channel_binding_application_data(bindings)
-        {
-            Ok(channel_bindings) => channel_bindings,
-            Err(major) => {
-                set_minor(minor, EINVAL);
-                return major;
-            }
-        };
         let Some(session_key) = derive_anonymous_session_key(
             &shared,
             &initiator_public,
@@ -3395,6 +3604,32 @@ pub unsafe extern "C" fn gss_accept_sec_context(
         return GSS_S_DEFECTIVE_TOKEN;
     };
     let acceptor_sigtypes = server_context.acceptor_sigtypes.as_ref().to_vec();
+    let Some(transcript_hash) = handshake_transcript_hash(
+        &initiator_sigtypes,
+        &acceptor_sigtypes,
+        &initiator_public,
+        &acceptor_public,
+        &initiator_nonce,
+        &acceptor_nonce,
+        &channel_bindings,
+    ) else {
+        set_minor(minor, EINVAL);
+        return GSS_S_FAILURE;
+    };
+    let Some(finished) = token.finished.as_ref() else {
+        set_minor(minor, EINVAL);
+        return GSS_S_DEFECTIVE_TOKEN;
+    };
+    if !verify_finished(
+        finished,
+        &session_key,
+        INITIATOR_FINISHED_LABEL,
+        &transcript_hash,
+        &acceptor_nonce,
+    ) {
+        set_minor(minor, EINVAL);
+        return GSS_S_BAD_SIG;
+    }
     let mut display_name = b"sshkey".to_vec();
     let mut authenticated = false;
 
@@ -3459,6 +3694,8 @@ pub unsafe extern "C" fn gss_accept_sec_context(
         ctx.server_context = Some(sctx.enc_part.as_ref().to_vec());
         ctx.display_name = display_name.clone();
         ctx.ecdh_key = None;
+        ctx.initiator_nonce = Some(initiator_nonce);
+        ctx.acceptor_nonce = Some(acceptor_nonce);
         ctx.authenticated = authenticated;
         ctx.send_seq = 0;
         ctx.recv_seq = 0;
@@ -4188,13 +4425,15 @@ mod tests {
     #[test]
     fn initial_token_carries_public_key() {
         let public_key = [7u8; X25519_PUBLIC_LEN];
-        let output = initial_context_token(&public_key).unwrap();
+        let nonce = vec![9u8; HANDSHAKE_NONCE_LEN];
+        let output = initial_context_token(&public_key, &nonce).unwrap();
         let inner = decapsulate_initial_token(&output).unwrap();
         let token = rasn::der::decode::<SshKeyToken>(inner).unwrap();
 
         assert!(token_has_status(&token, SSH_KEY_CONTINUE_NEEDED));
         let kex = token.kex.as_ref().unwrap();
         assert_eq!(kex_public_key(kex), Some(public_key));
+        assert_eq!(kex_nonce(kex), Some(nonce));
         assert!(kex_octets_match(&kex.kextype, KEX_ALG));
         assert!(kex_octets_match(&kex.enctype, ENC_ALG));
     }
@@ -4321,6 +4560,45 @@ mod tests {
         let mut insecure = packet;
         insecure[3] &= !DNS_FLAG_AD as u8;
         assert!(parse_sshfp_response(&insecure).is_none());
+    }
+
+    #[test]
+    fn finished_mac_binds_role_and_peer_nonce() {
+        unsafe {
+            let session_key = [0x42u8; SANON_SESSION_KEY_LEN];
+            let transcript_hash = [0x24u8; 32];
+            let peer_nonce = vec![0x11u8; HANDSHAKE_NONCE_LEN];
+            let other_nonce = vec![0x22u8; HANDSHAKE_NONCE_LEN];
+            let finished = make_finished(
+                &session_key,
+                INITIATOR_FINISHED_LABEL,
+                &transcript_hash,
+                &peer_nonce,
+            )
+            .unwrap();
+
+            assert!(verify_finished(
+                &finished,
+                &session_key,
+                INITIATOR_FINISHED_LABEL,
+                &transcript_hash,
+                &peer_nonce,
+            ));
+            assert!(!verify_finished(
+                &finished,
+                &session_key,
+                ACCEPTOR_FINISHED_LABEL,
+                &transcript_hash,
+                &peer_nonce,
+            ));
+            assert!(!verify_finished(
+                &finished,
+                &session_key,
+                INITIATOR_FINISHED_LABEL,
+                &transcript_hash,
+                &other_nonce,
+            ));
+        }
     }
 
     #[test]

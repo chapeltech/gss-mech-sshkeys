@@ -54,7 +54,6 @@ Host signatures and user signatures are cryptographically verified, but policy
 is not complete:
 
 - user keys are not checked against `authorized_keys`;
-- the draft's Finished MAC key confirmation is not implemented;
 - user signature retry negotiation is only partially wired.
 
 Without configured and authorized user credentials, the mechanism can still
