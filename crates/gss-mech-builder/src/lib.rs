@@ -255,29 +255,37 @@ unsafe fn allocate_iov_buffer(
     iov: &mut gss_iov_buffer_desc,
     len: usize,
 ) -> Result<(), Status> {
+    if (iov.type_ & GSS_IOV_BUFFER_FLAG_ALLOCATE) == 0 {
+        if len != 0 && iov.buffer.value.is_null() {
+            return Err(Status::new(GSS_S_FAILURE, EINVAL));
+        }
+        if iov.buffer.length < len {
+            return Err(Status::new(GSS_S_FAILURE, EINVAL));
+        }
+        iov.buffer.length = len;
+        return Ok(());
+    }
+
     if (iov.type_ & GSS_IOV_BUFFER_FLAG_ALLOCATED) != 0
         && !iov.buffer.value.is_null()
     {
         libc::free(iov.buffer.value);
-        iov.type_ &= !GSS_IOV_BUFFER_FLAG_ALLOCATED;
     }
 
-    iov.buffer.length = 0;
-    iov.buffer.value = ptr::null_mut();
-    if len == 0 {
-        if (iov.type_ & GSS_IOV_BUFFER_FLAG_ALLOCATE) != 0 {
-            iov.type_ |= GSS_IOV_BUFFER_FLAG_ALLOCATED;
-        }
-        return Ok(());
-    }
-
-    let value = libc::malloc(len);
-    if value.is_null() {
+    let value = if len == 0 {
+        ptr::null_mut()
+    } else {
+        libc::malloc(len)
+    };
+    if value.is_null() && len != 0 {
         return Err(Status::new(GSS_S_FAILURE, ENOMEM));
     }
     iov.buffer.length = len;
     iov.buffer.value = value;
-    iov.type_ |= GSS_IOV_BUFFER_FLAG_ALLOCATED;
+    iov.type_ = iov_buffer_type(iov.type_)
+        | ((iov.type_ & GSS_IOV_BUFFER_TYPE_FLAG_MASK)
+            & !GSS_IOV_BUFFER_FLAG_ALLOCATE)
+        | GSS_IOV_BUFFER_FLAG_ALLOCATED;
     Ok(())
 }
 

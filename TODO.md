@@ -21,6 +21,9 @@ publication.  Any protocol-affecting implementation change must update both.
   provides GSS ABI types and constants, buffer and IOV helpers, RFC4121 context
   plumbing, and a macro to export the RFC4121 per-message entrypoints for a
   mechanism context type.
+- Integrate `gss-mech-builder` for per-message services.  The ssh-key
+  mechanism now implements the builder's RFC4121 context trait and delegates
+  `gss_wrap()`, `gss_unwrap()`, and IOV entrypoints to the builder.
 
 ## Next Steps
 
@@ -48,9 +51,8 @@ publication.  Any protocol-affecting implementation change must update both.
      handoff to the RFC4121 backend.  The mechanism author supplies identity,
      signing, verification, host trust, and initiator authorization callbacks.
 
-   Move this mechanism's local per-message ABI and IOV boilerplate onto the
-   builder crate first, then add the higher-level signed-ECDH API under a
-   separate module so simpler mechanisms can keep using the lower layers.
+   Add the remaining common exports, then add the higher-level signed-ECDH API
+   under a separate module so simpler mechanisms can keep using lower layers.
 
 3. Add `authorized_keys` authorization.
 

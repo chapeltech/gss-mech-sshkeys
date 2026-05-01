@@ -18,8 +18,7 @@ use asn1::sshkey::{
 };
 use gss_mech_builder::sys::*;
 use gss_mech_builder::{
-    clear_buffer, iov_buffer_type, release_iov_allocations, set_buffer_bytes,
-    set_minor,
+    clear_buffer, set_buffer_bytes, set_minor, Rfc4121Context, Status,
 };
 use hmac::{Hmac, Mac};
 use rasn::types::{Integer, OctetString};
@@ -333,91 +332,6 @@ unsafe fn channel_binding_application_data(
         core::slice::from_raw_parts(app.value.cast::<u8>(), app.length)
             .to_vec(),
     )
-}
-
-fn iov_buffer_flags(type_: OM_uint32) -> OM_uint32 {
-    type_ & GSS_IOV_BUFFER_TYPE_FLAG_MASK
-}
-
-unsafe fn iov_slice<'a>(
-    iov: &'a gss_iov_buffer_desc,
-) -> Result<&'a [u8], OM_uint32> {
-    if iov.buffer.length == 0 {
-        return Ok(&[]);
-    }
-    if iov.buffer.value.is_null() {
-        return Err(GSS_S_FAILURE);
-    }
-
-    Ok(core::slice::from_raw_parts(
-        iov.buffer.value.cast::<u8>(),
-        iov.buffer.length,
-    ))
-}
-
-unsafe fn iov_slice_mut<'a>(
-    iov: &'a mut gss_iov_buffer_desc,
-) -> Result<&'a mut [u8], OM_uint32> {
-    if iov.buffer.length == 0 {
-        return Ok(&mut []);
-    }
-    if iov.buffer.value.is_null() {
-        return Err(GSS_S_FAILURE);
-    }
-
-    Ok(core::slice::from_raw_parts_mut(
-        iov.buffer.value.cast::<u8>(),
-        iov.buffer.length,
-    ))
-}
-
-unsafe fn allocate_iov_buffer(
-    iov: &mut gss_iov_buffer_desc,
-    len: usize,
-) -> Result<(), OM_uint32> {
-    let flags = iov_buffer_flags(iov.type_);
-    if (flags & GSS_IOV_BUFFER_FLAG_ALLOCATE) != 0 {
-        let value = if len == 0 {
-            ptr::null_mut()
-        } else {
-            libc::malloc(len)
-        };
-        if value.is_null() && len != 0 {
-            return Err(GSS_S_FAILURE);
-        }
-
-        iov.buffer.length = len;
-        iov.buffer.value = value;
-        iov.type_ = iov_buffer_type(iov.type_)
-            | ((flags & !GSS_IOV_BUFFER_FLAG_ALLOCATE)
-                | GSS_IOV_BUFFER_FLAG_ALLOCATED);
-        return Ok(());
-    }
-
-    if len != 0 && iov.buffer.value.is_null() {
-        return Err(GSS_S_FAILURE);
-    }
-    if iov.buffer.length < len {
-        return Err(GSS_S_FAILURE);
-    }
-    iov.buffer.length = len;
-    Ok(())
-}
-
-unsafe fn set_iov_length(
-    iov: &mut gss_iov_buffer_desc,
-    len: usize,
-) -> Result<(), OM_uint32> {
-    if (iov.type_ & GSS_IOV_BUFFER_FLAG_ALLOCATE) != 0 {
-        return allocate_iov_buffer(iov, len);
-    }
-
-    iov.buffer.length = len;
-    Ok(())
-}
-
-fn cfx_trailer_len(sealed: bool) -> usize {
-    rfc4121::trailer_len::<SshKeyRfc4121Profile>(sealed)
 }
 
 fn token_status(value: u8) -> SshKeyStatus {
@@ -1925,6 +1839,40 @@ impl rfc4121::CryptoProfile for SshKeyRfc4121Profile {
     }
 }
 
+impl Rfc4121Context for SshKeyCtx {
+    type Profile = SshKeyRfc4121Profile;
+
+    fn role(&self) -> rfc4121::Role {
+        cfx_role(self.is_initiator)
+    }
+
+    fn send_seq(&self) -> u64 {
+        self.send_seq
+    }
+
+    fn recv_seq(&self) -> u64 {
+        self.recv_seq
+    }
+
+    fn set_send_seq(&mut self, seq: u64) {
+        self.send_seq = seq;
+    }
+
+    fn set_recv_seq(&mut self, seq: u64) {
+        self.recv_seq = seq;
+    }
+
+    fn profile(&self) -> Result<Self::Profile, Status> {
+        if !self.complete {
+            return Err(Status::new(GSS_S_NO_CONTEXT, EINVAL));
+        }
+        let Some(session_key) = self.session_key else {
+            return Err(Status::new(GSS_S_NO_CONTEXT, EINVAL));
+        };
+        Ok(SshKeyRfc4121Profile { session_key })
+    }
+}
+
 fn cfx_role(is_initiator: bool) -> rfc4121::Role {
     if is_initiator {
         rfc4121::Role::Initiator
@@ -1933,41 +1881,15 @@ fn cfx_role(is_initiator: bool) -> rfc4121::Role {
     }
 }
 
-fn cfx_error_major(error: rfc4121::Error) -> OM_uint32 {
-    match error {
-        rfc4121::Error::BadSignature => GSS_S_BAD_SIG,
-        rfc4121::Error::DefectiveToken => GSS_S_DEFECTIVE_TOKEN,
-        rfc4121::Error::Failure => GSS_S_FAILURE,
-        rfc4121::Error::Sequence => GSS_S_UNSEQ_TOKEN,
-    }
-}
-
+#[cfg(test)]
 unsafe fn cfx_wrap_message_with_aad(
     ctx: &mut SshKeyCtx,
     conf_req: bool,
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<(Vec<u8>, bool), OM_uint32> {
-    if !ctx.complete {
-        return Err(GSS_S_NO_CONTEXT);
-    }
-    let Some(session_key) = ctx.session_key.as_ref() else {
-        return Err(GSS_S_NO_CONTEXT);
-    };
-
-    let profile = SshKeyRfc4121Profile {
-        session_key: *session_key,
-    };
-    let mut state = rfc4121::TokenState::new(
-        cfx_role(ctx.is_initiator),
-        ctx.send_seq,
-        ctx.recv_seq,
-    );
-    let result = state
-        .protect(&profile, conf_req, plaintext, aad)
-        .map_err(cfx_error_major)?;
-    ctx.send_seq = state.send_seq();
-    Ok((result.token, result.sealed))
+    gss_mech_builder::protect_message(ctx, conf_req, plaintext, aad)
+        .map_err(|status| status.major)
 }
 
 #[cfg(test)]
@@ -1978,270 +1900,14 @@ unsafe fn cfx_unwrap_message(
     cfx_unwrap_message_with_aad(ctx, token, &[])
 }
 
+#[cfg(test)]
 unsafe fn cfx_unwrap_message_with_aad(
     ctx: &mut SshKeyCtx,
     token: &[u8],
     aad: &[u8],
 ) -> Result<(Vec<u8>, bool), OM_uint32> {
-    if !ctx.complete {
-        return Err(GSS_S_NO_CONTEXT);
-    }
-    let Some(session_key) = ctx.session_key.as_ref() else {
-        return Err(GSS_S_NO_CONTEXT);
-    };
-
-    let profile = SshKeyRfc4121Profile {
-        session_key: *session_key,
-    };
-    let mut state = rfc4121::TokenState::new(
-        cfx_role(ctx.is_initiator),
-        ctx.send_seq,
-        ctx.recv_seq,
-    );
-    let result = state
-        .unprotect(&profile, token, aad)
-        .map_err(cfx_error_major)?;
-    ctx.recv_seq = state.recv_seq();
-    Ok((result.plaintext, result.sealed))
-}
-
-unsafe fn iov_buffers<'a>(
-    iov: gss_iov_buffer_t,
-    iov_count: c_int,
-) -> Result<&'a mut [gss_iov_buffer_desc], OM_uint32> {
-    if iov_count < 0 {
-        return Err(GSS_S_FAILURE);
-    }
-    if iov_count == 0 {
-        return Ok(&mut []);
-    }
-    if iov.is_null() {
-        return Err(GSS_S_FAILURE);
-    }
-
-    Ok(core::slice::from_raw_parts_mut(iov, iov_count as usize))
-}
-
-fn find_iov(iovs: &[gss_iov_buffer_desc], type_: OM_uint32) -> Option<usize> {
-    iovs.iter()
-        .position(|iov| iov_buffer_type(iov.type_) == type_)
-}
-
-fn iov_contains(iovs: &[gss_iov_buffer_desc], type_: OM_uint32) -> bool {
-    find_iov(iovs, type_).is_some()
-}
-
-fn validate_iov_types(iovs: &[gss_iov_buffer_desc]) -> Result<(), OM_uint32> {
-    for iov in iovs {
-        match iov_buffer_type(iov.type_) {
-            GSS_IOV_BUFFER_TYPE_EMPTY
-            | GSS_IOV_BUFFER_TYPE_DATA
-            | GSS_IOV_BUFFER_TYPE_HEADER
-            | GSS_IOV_BUFFER_TYPE_TRAILER
-            | GSS_IOV_BUFFER_TYPE_PADDING
-            | GSS_IOV_BUFFER_TYPE_STREAM
-            | GSS_IOV_BUFFER_TYPE_SIGN_ONLY => {}
-            _ => return Err(GSS_S_UNAVAILABLE),
-        }
-    }
-    Ok(())
-}
-
-unsafe fn collect_data_iovs(
-    iovs: &[gss_iov_buffer_desc],
-) -> Result<Vec<u8>, OM_uint32> {
-    collect_iovs_by_type(iovs, GSS_IOV_BUFFER_TYPE_DATA)
-}
-
-unsafe fn collect_sign_only_iovs(
-    iovs: &[gss_iov_buffer_desc],
-) -> Result<Vec<u8>, OM_uint32> {
-    collect_iovs_by_type(iovs, GSS_IOV_BUFFER_TYPE_SIGN_ONLY)
-}
-
-unsafe fn collect_iovs_by_type(
-    iovs: &[gss_iov_buffer_desc],
-    type_: OM_uint32,
-) -> Result<Vec<u8>, OM_uint32> {
-    let len = iov_type_len(iovs, type_)?;
-    let mut out = Vec::with_capacity(len);
-    for iov in iovs {
-        if iov_buffer_type(iov.type_) == type_ {
-            out.extend_from_slice(iov_slice(iov)?);
-        }
-    }
-    Ok(out)
-}
-
-fn iov_data_len(iovs: &[gss_iov_buffer_desc]) -> Result<usize, OM_uint32> {
-    iov_type_len(iovs, GSS_IOV_BUFFER_TYPE_DATA)
-}
-
-fn iov_type_len(
-    iovs: &[gss_iov_buffer_desc],
-    type_: OM_uint32,
-) -> Result<usize, OM_uint32> {
-    let mut len = 0usize;
-    for iov in iovs {
-        if iov_buffer_type(iov.type_) == type_ {
-            len = len.checked_add(iov.buffer.length).ok_or(GSS_S_FAILURE)?;
-        }
-    }
-    Ok(len)
-}
-
-unsafe fn copy_data_to_iovs(
-    iovs: &mut [gss_iov_buffer_desc],
-    data: &[u8],
-) -> Result<(), OM_uint32> {
-    let mut offset = 0usize;
-    for iov in iovs {
-        if iov_buffer_type(iov.type_) != GSS_IOV_BUFFER_TYPE_DATA {
-            continue;
-        }
-
-        let len = iov.buffer.length;
-        if data.len().checked_sub(offset).ok_or(GSS_S_FAILURE)? < len {
-            return Err(GSS_S_DEFECTIVE_TOKEN);
-        }
-        let dst = iov_slice_mut(iov)?;
-        if len != 0 {
-            dst.copy_from_slice(&data[offset..offset + len]);
-        }
-        offset += len;
-    }
-
-    if offset != data.len() {
-        return Err(GSS_S_DEFECTIVE_TOKEN);
-    }
-    Ok(())
-}
-
-unsafe fn set_iov_bytes(
-    iov: &mut gss_iov_buffer_desc,
-    bytes: &[u8],
-) -> Result<(), OM_uint32> {
-    allocate_iov_buffer(iov, bytes.len())?;
-    let dst = iov_slice_mut(iov)?;
-    if !bytes.is_empty() {
-        dst.copy_from_slice(bytes);
-    }
-    Ok(())
-}
-
-unsafe fn set_iov_lengths(
-    iovs: &mut [gss_iov_buffer_desc],
-    conf_req: bool,
-) -> Result<(), OM_uint32> {
-    let data_len = iov_data_len(iovs)?;
-    let trailer_len = cfx_trailer_len(conf_req);
-
-    if let Some(stream) = find_iov(iovs, GSS_IOV_BUFFER_TYPE_STREAM) {
-        let len = CFX_HEADER_LEN
-            .checked_add(data_len)
-            .and_then(|len| len.checked_add(trailer_len))
-            .ok_or(GSS_S_FAILURE)?;
-        set_iov_length(&mut iovs[stream], len)?;
-        return Ok(());
-    }
-
-    let header =
-        find_iov(iovs, GSS_IOV_BUFFER_TYPE_HEADER).ok_or(GSS_S_FAILURE)?;
-    let trailer =
-        find_iov(iovs, GSS_IOV_BUFFER_TYPE_TRAILER).ok_or(GSS_S_FAILURE)?;
-
-    set_iov_length(&mut iovs[header], CFX_HEADER_LEN)?;
-    set_iov_length(&mut iovs[trailer], trailer_len)?;
-    for iov in iovs {
-        if iov_buffer_type(iov.type_) == GSS_IOV_BUFFER_TYPE_PADDING {
-            set_iov_length(iov, 0)?;
-        }
-    }
-    Ok(())
-}
-
-unsafe fn cfx_wrap_iov_message(
-    ctx: &mut SshKeyCtx,
-    conf_req: bool,
-    iovs: &mut [gss_iov_buffer_desc],
-) -> Result<bool, OM_uint32> {
-    validate_iov_types(iovs)?;
-    let plaintext = collect_data_iovs(iovs)?;
-    let aad = collect_sign_only_iovs(iovs)?;
-    let (token, sealed) =
-        cfx_wrap_message_with_aad(ctx, conf_req, &plaintext, &aad)?;
-    let trailer_len = cfx_trailer_len(sealed);
-    if token.len() != CFX_HEADER_LEN + plaintext.len() + trailer_len {
-        return Err(GSS_S_FAILURE);
-    }
-
-    if let Some(stream) = find_iov(iovs, GSS_IOV_BUFFER_TYPE_STREAM) {
-        if iov_contains(iovs, GSS_IOV_BUFFER_TYPE_HEADER)
-            || iov_contains(iovs, GSS_IOV_BUFFER_TYPE_TRAILER)
-        {
-            return Err(GSS_S_FAILURE);
-        }
-        set_iov_bytes(&mut iovs[stream], &token)?;
-        return Ok(sealed);
-    }
-
-    let header =
-        find_iov(iovs, GSS_IOV_BUFFER_TYPE_HEADER).ok_or(GSS_S_FAILURE)?;
-    let trailer =
-        find_iov(iovs, GSS_IOV_BUFFER_TYPE_TRAILER).ok_or(GSS_S_FAILURE)?;
-    let body_end = CFX_HEADER_LEN + plaintext.len();
-
-    set_iov_bytes(&mut iovs[header], &token[..CFX_HEADER_LEN])?;
-    copy_data_to_iovs(iovs, &token[CFX_HEADER_LEN..body_end])?;
-    set_iov_bytes(&mut iovs[trailer], &token[body_end..])?;
-    for iov in iovs {
-        if iov_buffer_type(iov.type_) == GSS_IOV_BUFFER_TYPE_PADDING {
-            allocate_iov_buffer(iov, 0)?;
-        }
-    }
-
-    Ok(sealed)
-}
-
-unsafe fn cfx_unwrap_iov_message(
-    ctx: &mut SshKeyCtx,
-    iovs: &mut [gss_iov_buffer_desc],
-) -> Result<bool, OM_uint32> {
-    validate_iov_types(iovs)?;
-    let aad = collect_sign_only_iovs(iovs)?;
-
-    if let Some(stream) = find_iov(iovs, GSS_IOV_BUFFER_TYPE_STREAM) {
-        let token = iov_slice(&iovs[stream])?.to_vec();
-        let (message, sealed) = cfx_unwrap_message_with_aad(ctx, &token, &aad)?;
-        let data =
-            find_iov(iovs, GSS_IOV_BUFFER_TYPE_DATA).ok_or(GSS_S_FAILURE)?;
-        set_iov_bytes(&mut iovs[data], &message)?;
-        return Ok(sealed);
-    }
-
-    let header =
-        find_iov(iovs, GSS_IOV_BUFFER_TYPE_HEADER).ok_or(GSS_S_FAILURE)?;
-    let trailer =
-        find_iov(iovs, GSS_IOV_BUFFER_TYPE_TRAILER).ok_or(GSS_S_FAILURE)?;
-
-    let mut token = Vec::new();
-    token.extend_from_slice(iov_slice(&iovs[header])?);
-    for iov in iovs.iter() {
-        if iov_buffer_type(iov.type_) == GSS_IOV_BUFFER_TYPE_DATA {
-            token.extend_from_slice(iov_slice(iov)?);
-        }
-    }
-    token.extend_from_slice(iov_slice(&iovs[trailer])?);
-
-    let (message, sealed) = cfx_unwrap_message_with_aad(ctx, &token, &aad)?;
-    copy_data_to_iovs(iovs, &message)?;
-    for iov in iovs {
-        if iov_buffer_type(iov.type_) == GSS_IOV_BUFFER_TYPE_PADDING {
-            allocate_iov_buffer(iov, 0)?;
-        }
-    }
-
-    Ok(sealed)
+    gss_mech_builder::unprotect_message(ctx, token, aad)
+        .map_err(|status| status.major)
 }
 
 fn encode_der_length(out: &mut Vec<u8>, len: usize) {
@@ -3685,18 +3351,20 @@ pub unsafe extern "C" fn gss_inquire_context(
 #[no_mangle]
 pub unsafe extern "C" fn gss_wrap_size_limit(
     minor: *mut OM_uint32,
-    _ctx: gss_const_ctx_id_t,
-    _conf_req_flag: i32,
-    _qop_req: gss_qop_t,
+    ctx: gss_const_ctx_id_t,
+    conf_req_flag: i32,
+    qop_req: gss_qop_t,
     req_output_size: OM_uint32,
     max_input_size: *mut OM_uint32,
 ) -> OM_uint32 {
-    if !max_input_size.is_null() {
-        let overhead = CFX_HEADER_LEN + CFX_HEADER_LEN + CFX_GCM_TAG_LEN;
-        *max_input_size = req_output_size.saturating_sub(overhead as u32);
-    }
-    set_minor(minor, 0);
-    GSS_S_COMPLETE
+    gss_mech_builder::wrap_size_limit::<SshKeyCtx>(
+        minor,
+        ctx,
+        conf_req_flag,
+        qop_req,
+        req_output_size,
+        max_input_size,
+    )
 }
 
 #[no_mangle]
@@ -3791,83 +3459,15 @@ pub unsafe extern "C" fn gss_wrap(
     conf_state: *mut i32,
     output: gss_buffer_t,
 ) -> OM_uint32 {
-    clear_buffer(output);
-    if !conf_state.is_null() {
-        *conf_state = 0;
-    }
-    if ctx.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_NO_CONTEXT;
-    }
-    if input.is_null() || output.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_FAILURE;
-    }
-
-    if (*input).length != 0 && (*input).value.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_FAILURE;
-    }
-
-    let mut data = core::slice::from_raw_parts(
-        (*input).value.cast::<u8>(),
-        (*input).length,
-    )
-    .to_vec();
-    let mut iovs = [
-        gss_iov_buffer_desc {
-            type_: GSS_IOV_BUFFER_TYPE_HEADER | GSS_IOV_BUFFER_FLAG_ALLOCATE,
-            buffer: gss_buffer_desc {
-                length: 0,
-                value: ptr::null_mut(),
-            },
-        },
-        gss_iov_buffer_desc {
-            type_: GSS_IOV_BUFFER_TYPE_DATA,
-            buffer: gss_buffer_desc {
-                length: data.len(),
-                value: data.as_mut_ptr().cast(),
-            },
-        },
-        gss_iov_buffer_desc {
-            type_: GSS_IOV_BUFFER_TYPE_TRAILER | GSS_IOV_BUFFER_FLAG_ALLOCATE,
-            buffer: gss_buffer_desc {
-                length: 0,
-                value: ptr::null_mut(),
-            },
-        },
-    ];
-
-    let major = gss_wrap_iov_inner(
+    gss_mech_builder::wrap::<SshKeyCtx>(
         minor,
-        ctx.cast_mut(),
+        ctx,
         conf_req_flag,
         qop_req,
+        input,
         conf_state,
-        iovs.as_mut_ptr(),
-        iovs.len() as c_int,
-    );
-    if major != GSS_S_COMPLETE {
-        release_iov_allocations(iovs.as_mut_ptr(), iovs.len() as c_int);
-        return major;
-    }
-
-    let header = iov_slice(&iovs[0]).unwrap_or(&[]);
-    let wrapped_data = iov_slice(&iovs[1]).unwrap_or(&[]);
-    let trailer = iov_slice(&iovs[2]).unwrap_or(&[]);
-    let mut token =
-        Vec::with_capacity(header.len() + wrapped_data.len() + trailer.len());
-    token.extend_from_slice(header);
-    token.extend_from_slice(wrapped_data);
-    token.extend_from_slice(trailer);
-
-    let ret = set_buffer_bytes(minor, output, &token);
-    release_iov_allocations(iovs.as_mut_ptr(), iovs.len() as c_int);
-    if ret != GSS_S_COMPLETE {
-        return ret;
-    }
-    set_minor(minor, 0);
-    GSS_S_COMPLETE
+        output,
+    )
 }
 
 #[no_mangle]
@@ -3879,60 +3479,9 @@ pub unsafe extern "C" fn gss_unwrap(
     conf_state: *mut i32,
     qop_state: *mut gss_qop_t,
 ) -> OM_uint32 {
-    clear_buffer(output);
-    if !conf_state.is_null() {
-        *conf_state = 0;
-    }
-    if !qop_state.is_null() {
-        *qop_state = 0;
-    }
-    if ctx.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_NO_CONTEXT;
-    }
-    if input.is_null() || output.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_FAILURE;
-    }
-    if (*input).length != 0 && (*input).value.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_FAILURE;
-    }
-
-    let mut iovs = [
-        gss_iov_buffer_desc {
-            type_: GSS_IOV_BUFFER_TYPE_STREAM,
-            buffer: gss_buffer_desc {
-                length: (*input).length,
-                value: (*input).value,
-            },
-        },
-        gss_iov_buffer_desc {
-            type_: GSS_IOV_BUFFER_TYPE_DATA | GSS_IOV_BUFFER_FLAG_ALLOCATE,
-            buffer: gss_buffer_desc {
-                length: 0,
-                value: ptr::null_mut(),
-            },
-        },
-    ];
-
-    let major = gss_unwrap_iov_inner(
-        minor,
-        ctx.cast_mut(),
-        conf_state,
-        qop_state,
-        iovs.as_mut_ptr(),
-        iovs.len() as c_int,
-    );
-    if major != GSS_S_COMPLETE {
-        release_iov_allocations(iovs.as_mut_ptr(), iovs.len() as c_int);
-        return major;
-    }
-
-    (*output).length = iovs[1].buffer.length;
-    (*output).value = iovs[1].buffer.value;
-    set_minor(minor, 0);
-    GSS_S_COMPLETE
+    gss_mech_builder::unwrap::<SshKeyCtx>(
+        minor, ctx, input, output, conf_state, qop_state,
+    )
 }
 
 #[no_mangle]
@@ -3945,84 +3494,15 @@ pub unsafe extern "C" fn gss_wrap_iov_length(
     iov: gss_iov_buffer_t,
     iov_count: c_int,
 ) -> OM_uint32 {
-    if !conf_state.is_null() {
-        *conf_state = i32::from(conf_req_flag != 0);
-    }
-    if ctx.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_NO_CONTEXT;
-    }
-
-    let iovs = match iov_buffers(iov, iov_count) {
-        Ok(iovs) => iovs,
-        Err(major) => {
-            set_minor(minor, EINVAL);
-            return major;
-        }
-    };
-    if let Err(major) = validate_iov_types(iovs)
-        .and_then(|_| set_iov_lengths(iovs, conf_req_flag != 0))
-    {
-        set_minor(
-            minor,
-            if major == GSS_S_UNAVAILABLE {
-                ENOTSUP
-            } else {
-                EINVAL
-            },
-        );
-        return major;
-    }
-
-    set_minor(minor, 0);
-    GSS_S_COMPLETE
-}
-
-unsafe fn gss_wrap_iov_inner(
-    minor: *mut OM_uint32,
-    ctx: gss_ctx_id_t,
-    conf_req_flag: i32,
-    _qop_req: gss_qop_t,
-    conf_state: *mut i32,
-    iov: gss_iov_buffer_t,
-    iov_count: c_int,
-) -> OM_uint32 {
-    if !conf_state.is_null() {
-        *conf_state = 0;
-    }
-    if ctx.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_NO_CONTEXT;
-    }
-
-    let iovs = match iov_buffers(iov, iov_count) {
-        Ok(iovs) => iovs,
-        Err(major) => {
-            set_minor(minor, EINVAL);
-            return major;
-        }
-    };
-    let ctx = &mut *(ctx.cast::<SshKeyCtx>());
-    let sealed = match cfx_wrap_iov_message(ctx, conf_req_flag != 0, iovs) {
-        Ok(sealed) => sealed,
-        Err(major) => {
-            set_minor(
-                minor,
-                if major == GSS_S_UNAVAILABLE {
-                    ENOTSUP
-                } else {
-                    EINVAL
-                },
-            );
-            return major;
-        }
-    };
-
-    if !conf_state.is_null() {
-        *conf_state = i32::from(sealed);
-    }
-    set_minor(minor, 0);
-    GSS_S_COMPLETE
+    gss_mech_builder::wrap_iov_length::<SshKeyCtx>(
+        minor,
+        ctx,
+        conf_req_flag,
+        _qop_req,
+        conf_state,
+        iov,
+        iov_count,
+    )
 }
 
 #[no_mangle]
@@ -4035,7 +3515,7 @@ pub unsafe extern "C" fn gss_wrap_iov(
     iov: gss_iov_buffer_t,
     iov_count: c_int,
 ) -> OM_uint32 {
-    gss_wrap_iov_inner(
+    gss_mech_builder::wrap_iov::<SshKeyCtx>(
         minor,
         ctx,
         conf_req_flag,
@@ -4044,55 +3524,6 @@ pub unsafe extern "C" fn gss_wrap_iov(
         iov,
         iov_count,
     )
-}
-
-unsafe fn gss_unwrap_iov_inner(
-    minor: *mut OM_uint32,
-    ctx: gss_ctx_id_t,
-    conf_state: *mut i32,
-    qop_state: *mut gss_qop_t,
-    iov: gss_iov_buffer_t,
-    iov_count: c_int,
-) -> OM_uint32 {
-    if !conf_state.is_null() {
-        *conf_state = 0;
-    }
-    if !qop_state.is_null() {
-        *qop_state = 0;
-    }
-    if ctx.is_null() {
-        set_minor(minor, EINVAL);
-        return GSS_S_NO_CONTEXT;
-    }
-
-    let iovs = match iov_buffers(iov, iov_count) {
-        Ok(iovs) => iovs,
-        Err(major) => {
-            set_minor(minor, EINVAL);
-            return major;
-        }
-    };
-    let ctx = &mut *(ctx.cast::<SshKeyCtx>());
-    let sealed = match cfx_unwrap_iov_message(ctx, iovs) {
-        Ok(sealed) => sealed,
-        Err(major) => {
-            set_minor(
-                minor,
-                if major == GSS_S_UNAVAILABLE {
-                    ENOTSUP
-                } else {
-                    EINVAL
-                },
-            );
-            return major;
-        }
-    };
-
-    if !conf_state.is_null() {
-        *conf_state = i32::from(sealed);
-    }
-    set_minor(minor, 0);
-    GSS_S_COMPLETE
 }
 
 #[no_mangle]
@@ -4104,7 +3535,9 @@ pub unsafe extern "C" fn gss_unwrap_iov(
     iov: gss_iov_buffer_t,
     iov_count: c_int,
 ) -> OM_uint32 {
-    gss_unwrap_iov_inner(minor, ctx, conf_state, qop_state, iov, iov_count)
+    gss_mech_builder::unwrap_iov::<SshKeyCtx>(
+        minor, ctx, conf_state, qop_state, iov, iov_count,
+    )
 }
 
 #[no_mangle]
@@ -4113,9 +3546,7 @@ pub unsafe extern "C" fn gss_release_iov_buffer(
     iov: gss_iov_buffer_t,
     iov_count: c_int,
 ) -> OM_uint32 {
-    release_iov_allocations(iov, iov_count);
-    set_minor(minor, 0);
-    GSS_S_COMPLETE
+    gss_mech_builder::release_iov_buffer(minor, iov, iov_count)
 }
 
 #[cfg(test)]
