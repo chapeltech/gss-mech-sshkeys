@@ -14,7 +14,8 @@ For example, if an IMAP server runs on a host where `alice` has her SSH public
 key in `~alice/.ssh/authorized_keys`, then Alice should be able to use a
 GSS-capable IMAP client such as `mutt` without typing an IMAP password.  The
 mechanism should reuse the SSH deployment that already exists: OpenSSH key
-files, `ssh-agent`, SSH signature formats, and `authorized_keys` authorization.
+files, `ssh-agent`, SSH signature formats, SSH host-key trust data, and
+`authorized_keys` authorization.
 
 ## Status
 
@@ -40,8 +41,10 @@ Implemented so far:
 Not complete yet:
 
 - `ssh-agent` signing.
-- Client host key trust policy.
+- Client host key trust policy through `known_hosts` and DNSSEC-validated
+  SSHFP records.
 - `authorized_keys` lookup and authorization.
+- Finished MAC key confirmation from the current draft.
 - Production OID assignment and packaged installation.
 
 Without a configured user key, the mechanism still completes anonymously and
@@ -98,12 +101,15 @@ sshkey 1.3.6.1.4.1.99999.1 ../../sshkey.so -
 The OID is a placeholder.  A real deployment needs an assigned OID and an
 installation path appropriate for the host GSS implementation.
 
-Prototype signing configuration is environment-variable based:
+Prototype signing configuration is environment-variable based.  This is not
+the final initiator credential model; the intended client-side implementation
+uses `ssh-agent` only, because a GSS mechanism generally cannot interactively
+ask the user for SSH key passphrases.
 
 - `SSHKEY_HOST_KEY`: OpenSSH private key used by the acceptor to sign its ECDH
   reply.
 - `SSHKEY_USER_KEY`: OpenSSH private key used by the initiator to sign
-  encrypted user authentication.
+  encrypted user authentication in the current prototype only.
 - `SSHKEY_USER`: authorization name signed by the initiator.  Defaults to
   `USER`, then `sshkey`.
 - `SSHKEY_CTX_KEY`: 32-byte hex key used to encrypt acceptor continuation
@@ -118,20 +124,29 @@ finishing the authentication.
 The protocol is documented in `sshkey.asn1` and in
 `draft-dowdeswell-kitten-gss-sshkey-00.xml`.
 
-The current anonymous exchange intentionally follows Heimdal SAnon-X25519's
-base key derivation so the Rust implementation can be tested against known
-behavior while remaining standalone.  The current signed flow is:
+The anonymous ECDH base intentionally follows Heimdal SAnon-X25519's key
+derivation so the Rust implementation can be tested against known behavior
+while remaining standalone.  The intended signed flow has two conceptual
+pieces:
 
-- the acceptor signs the exchange with an SSH host key;
-- the initiator verifies the host signature cryptographically;
-- the initiator sends the requested user name and a user-key signature inside
-  the encrypted exchange;
-- the acceptor verifies that signature against the supplied SSH public key.
+- peers sign their ECDH contribution and associated algorithm, name, and
+  channel-binding context with SSH keys;
+- after ECDH, peers demonstrate knowledge of the derived session key with a
+  Finished MAC.
+
+User authentication remains an encrypted ASN.1 payload.  It may appear in any
+token sent after the sender has enough ECDH material to derive the session key.
+In initiator-first protocols this keeps the username and user public key out of
+the first cleartext token without adding a round trip.
 
 The mechanism also supports acceptor-first operation.  If a protocol calls
 `gss_accept_sec_context()` before any initiator token exists, the acceptor sends
 a signed ECDH challenge and encrypted `sctx`; the initiator returns its ECDH
-public key, encrypted userauth when available, and the same `sctx`.
+public key, encrypted userauth, key confirmation, and the same `sctx`.
+HTTP Negotiate can use this mode naturally: the server can include an
+acceptor-first token in a `401 WWW-Authenticate` header, and the client can
+return its response token in the `Authorization` header.
 
 The next step is policy: verifying the host key through normal SSH trust data
-and checking the user key against the target user's `authorized_keys`.
+including `known_hosts` and DNSSEC-validated SSHFP records, and checking the
+user key against the target user's `authorized_keys`.

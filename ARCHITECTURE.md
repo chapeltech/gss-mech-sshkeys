@@ -38,7 +38,7 @@ normal buffers and IOV buffers share per-message protection behavior.
 Prototype credential and state configuration is environment-variable based:
 
 - `SSHKEY_HOST_KEY`: OpenSSH private key used for acceptor host signatures.
-- `SSHKEY_USER_KEY`: OpenSSH private key used for initiator user signatures.
+- `SSHKEY_USER_KEY`: temporary prototype-only initiator signing key.
 - `SSHKEY_USER`: requested authorization identity.
 - `SSHKEY_CTX_KEY`: 32-byte hex key for encrypted acceptor continuation state.
 
@@ -51,10 +51,15 @@ cannot finish the same authentication.
 Host signatures and user signatures are cryptographically verified, but policy
 is not complete:
 
-- host key trust is not checked against SSH known-hosts policy;
+- host key trust is not checked against `known_hosts` or SSHFP;
 - user keys are not checked against `authorized_keys`;
 - `ssh-agent` signing is not implemented;
+- the draft's Finished MAC key confirmation is not implemented;
 - user signature retry negotiation is only partially wired.
+
+The draft now specifies `ssh-agent` as the initiator credential source.  The
+current `SSHKEY_USER_KEY` path remains only to keep smoke tests working until
+agent signing is implemented.
 
 Without configured and authorized user credentials, the mechanism can still
 complete anonymously.  That remains useful for loader, KDF, and per-message
@@ -74,4 +79,3 @@ is tested through Heimdal loading.  The acceptor-first path is tested by direct
 - `tests/gss-token/`: Heimdal loader, direct interposition, and `gss-token`
   smoke tests.
 - `Makefile`: Cargo build wrapper and test entrypoint.
-

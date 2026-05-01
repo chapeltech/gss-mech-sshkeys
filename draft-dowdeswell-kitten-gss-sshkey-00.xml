@@ -62,8 +62,10 @@
       <t>
         The initiator is the user side of the exchange.  The acceptor is the
         service or host side.  The acceptor proves possession of a trusted
-        SSH host private key.  After a shared session secret has been
-        derived, the initiator proves possession of an SSH user private key.
+        SSH host private key.  After a shared session secret can be derived,
+        the initiator proves possession of an SSH user private key in an
+        encrypted user-authentication payload.  Both peers then prove
+        knowledge of the derived session key.
       </t>
       <t>
         Context-establishment tokens are DER encodings of the ASN.1
@@ -105,14 +107,19 @@
       <t>
         The acceptor credential consists of one or more SSH host private
         keys and their public-key metadata.  The initiator credential
-        consists of one or more SSH user private keys and their public-key
-        metadata.
+        consists of SSH user keys available through an SSH agent.  A GSS
+        mechanism implementation normally cannot prompt for SSH private-key
+        passphrases, so initiator implementations of this mechanism MUST NOT
+        depend on direct user interaction to unlock private key files.
       </t>
       <t>
         An implementation MUST define how trusted acceptor host public keys
-        are found.  A deployment MAY use an SSH known_hosts database, a
-        certificate authority, or another local trust store.  This protocol
-        does not make unauthenticated host keys trustworthy.
+        are found.  Implementations MUST support OpenSSH known_hosts style
+        host-key databases and MUST support SSHFP DNS resource records.
+        SSHFP records MUST be treated as authentic only when the DNS answer
+        is DNSSEC validated.  A deployment MAY additionally use a certificate
+        authority or another local trust store.  This protocol does not make
+        unauthenticated host keys trustworthy.
       </t>
     </section>
 
@@ -193,6 +200,9 @@ SSH-string(initiator-signature-algorithms) ||
 SSH-string(acceptor-signature-algorithms) ||
 SSH-string(initiator-ecdh-public-key) ||
 SSH-string(acceptor-ecdh-public-key) ||
+SSH-string(initiator-nonce) ||
+SSH-string(acceptor-nonce) ||
+SSH-string(acceptor-name) ||
 SSH-string(channel-binding-application-data)
 ]]></sourcecode>
       <t>
@@ -205,6 +215,8 @@ SSH-string(kex-algorithm) ||
 SSH-string(encryption-algorithm) ||
 SSH-string(acceptor-signature-algorithms) ||
 SSH-string(acceptor-ecdh-public-key) ||
+SSH-string(acceptor-nonce) ||
+SSH-string(acceptor-name) ||
 SSH-string(channel-binding-application-data)
 ]]></sourcecode>
       <t>
@@ -219,11 +231,22 @@ SSH-string(initiator-signature-algorithms) ||
 SSH-string(acceptor-signature-algorithms) ||
 SSH-string(initiator-ecdh-public-key) ||
 SSH-string(acceptor-ecdh-public-key) ||
+SSH-string(initiator-nonce) ||
+SSH-string(acceptor-nonce) ||
+SSH-string(acceptor-name) ||
 SSH-string(username) ||
 SSH-string(user-public-key-type) ||
 SSH-string(user-public-key-blob) ||
-SSH-string(user-signature-algorithm)
+SSH-string(user-signature-algorithm) ||
+SSH-string(channel-binding-application-data)
 ]]></sourcecode>
+      <t>
+        EncSshKeyUserAuth is not tied to a single final user-authentication
+        step.  It MAY appear in any token sent after the sender has enough
+        ECDH material to derive K_base.  The encrypted payload lets
+        initiator-first exchanges keep the username and user public key
+        confidential from passive observers without adding a round trip.
+      </t>
       <t>
         Let Z be the raw shared secret produced by the selected key exchange.
         The anonymous ECDH profile derives the base session key with the same
@@ -245,6 +268,13 @@ K_base = KDF(
         mechanism-specific HMAC-SHA256 labels.  Nonces MUST NOT repeat for a
         given key and MUST include monotonically increasing sequence numbers.
       </t>
+      <t>
+        Key confirmation uses a finished key derived from K_base and the
+        transcript hash.  SshKeyFinished.mac is an HMAC over a role label,
+        the transcript hash, and the peer nonce.  This proves possession of
+        the ECDH-derived session key and does not require an additional SSH
+        signature or SSH agent operation.
+      </t>
     </section>
 
     <section anchor="flow">
@@ -256,7 +286,10 @@ K_base = KDF(
           SSH-KEY-CONTINUE-NEEDED and a SshKeyKEX value.  The kextypes,
           enctypes, and sigtypes fields contain the initiator algorithm
           lists.  The kextype, enctype, and pk fields SHOULD contain the
-          initiator's preferred proposal.
+          initiator's preferred proposal.  The first initiator token SHOULD
+          NOT contain EncSshKeyUserAuth, because the initiator cannot encrypt
+          user authentication until it has received the acceptor ECDH public
+          key.
         </t>
       </section>
       <section anchor="acceptor-first-token">
@@ -271,9 +304,22 @@ K_base = KDF(
         </t>
         <t>
           The initiator response to an acceptor-first token contains its own
-          SshKeyKEX value, encuserauth when available, and the reflected sctx.
-          The acceptor uses sctx to recover its ephemeral ECDH state, derives
-          the session key, and continues as in the initiator-first exchange.
+          SshKeyKEX value, EncSshKeyUserAuth, SshKeyFinished, and the
+          reflected sctx.  The acceptor uses sctx to recover its ephemeral
+          ECDH state, derives the session key, decrypts the user
+          authentication payload, validates the user signature, checks local
+          authorization policy, and verifies the initiator finished MAC.
+        </t>
+        <t>
+          HTTP Negotiate is a natural acceptor-first deployment.  An HTTP
+          server MAY include an acceptor-first GSS-SSHKEY token in a 401
+          WWW-Authenticate header.  The HTTP client can then return its ECDH
+          public key, encrypted user authentication, key confirmation, and
+          reflected sctx in the Authorization header.  This lets the server
+          authenticate the request during the normal HTTP authentication
+          challenge round trip.  If explicit acceptor key confirmation is
+          required by the local implementation, the server can carry a final
+          acceptor SshKeyFinished token in the HTTP response.
         </t>
       </section>
       <section anchor="acceptor-token">
@@ -286,30 +332,34 @@ K_base = KDF(
           SshKeyHostAuth value containing a hostauth signature.
         </t>
         <t>
-          The initiator MUST verify the selected algorithms, the host public
-          key trust chain, and hostauth.sig before sending user
-          authentication data.
+          In initiator-first exchanges, the acceptor can derive the session
+          key after receiving the initiator public key.  The acceptor token
+          therefore MAY also contain SshKeyFinished.  The initiator verifies
+          the selected algorithms, hostauth.sig, and host-key trust policy
+          before completing the context.
         </t>
       </section>
       <section anchor="userauth-token">
-        <name>Initiator User Authentication Token</name>
+        <name>Encrypted User Authentication</name>
         <t>
-        The initiator derives the session keys, computes the user
-          signature described in <xref target="transcript"/>, DER encodes
-          SshKeyUserAuth, encrypts it as EncSshKeyUserAuth, and returns a
-          token with encuserauth set.  The initiator MUST also return sctx
-          unchanged when sctx was present in the acceptor token.
+          Once the initiator has the acceptor ECDH public key, it derives the
+          session keys, computes the user signature described in
+          <xref target="transcript"/>, DER encodes SshKeyUserAuth, encrypts
+          it as EncSshKeyUserAuth, and sends it in the next token.  The same
+          token SHOULD contain the initiator SshKeyFinished value and MUST
+          return sctx unchanged when sctx was present in the acceptor token.
         </t>
       </section>
       <section anchor="complete-token">
         <name>Completion Token</name>
         <t>
-        The acceptor decrypts encuserauth, validates the SSH user
-          signature, authorizes the requested username, and returns
-          SSH-KEY-COMPLETE.  If the signature algorithm is not acceptable,
-          the acceptor MAY return SSH-KEY-CONTINUE-NEEDED with sctx and a
-          narrower sigtypes list.  If validation or authorization fails, the
-          acceptor returns SSH-KEY-FAILURE.
+          The acceptor decrypts encuserauth, validates the SSH user
+          signature, authorizes the requested username, verifies the
+          initiator finished MAC, and returns SSH-KEY-COMPLETE.  If the
+          signature algorithm is not acceptable, the acceptor MAY return
+          SSH-KEY-CONTINUE-NEEDED with sctx and a narrower sigtypes list.  If
+          validation, key confirmation, or authorization fails, the acceptor
+          returns SSH-KEY-FAILURE.
         </t>
         <t>
           A peer that receives SSH-KEY-FAILURE MUST fail context
@@ -391,13 +441,18 @@ K_base = KDF(
       </t>
       <t>
         Signature inputs bind the algorithm lists, selected algorithms, and
-        key-exchange public values.  Omitting any of these values can permit
-        downgrade or unknown-key-share attacks.
+        key-exchange public values.  The finished MAC binds the derived
+        session key to the same transcript.  Omitting these values can permit
+        downgrade, unknown-key-share, or key-confirmation failures.
       </t>
       <t>
-        EncSshKeyUserAuth hides the username and user signature from passive
-        observers after the ephemeral key exchange.  Implementations MUST
-        verify the acceptor host signature before sending EncSshKeyUserAuth.
+        EncSshKeyUserAuth hides the username, user public key, and user
+        signature from passive observers.  To reduce active identity probing,
+        initiator implementations SHOULD validate the acceptor host signature
+        and host-key trust policy before sending EncSshKeyUserAuth when that
+        policy information is available locally.  In all cases,
+        implementations MUST NOT report a mutually authenticated context
+        unless host-key policy succeeds.
       </t>
       <t>
         All encrypted fields require nonce uniqueness.  Reusing a nonce with
@@ -424,8 +479,10 @@ K_base = KDF(
         SSH signature blob handling, encrypted acceptor continuation state,
         client-first and acceptor-first context establishment, RFC 4121-style
         per-message protection, and smoke tests that prove Heimdal can load
-        the mechanism.  Host key trust policy, ssh-agent signing, and
-        authorized_keys authorization remain implementation work.
+        the mechanism.  The implementation has not yet caught up with this
+        draft's finished MAC, SSH-agent-only initiator credential model,
+        SSHFP and known_hosts host-key trust policy, or authorized_keys
+        authorization.
       </t>
     </section>
 
@@ -472,6 +529,11 @@ SshKeyKEX ::= SEQUENCE {
 	, kextype	[3] OCTET STRING	OPTIONAL
 	, pk		[4] OCTET STRING	OPTIONAL
 	, enctype	[5] OCTET STRING	OPTIONAL
+	, nonce		[6] OCTET STRING	OPTIONAL
+}
+
+SshKeyFinished ::= SEQUENCE {
+	  mac		[0] OCTET STRING
 }
 
 SshKeyServerContext ::= SEQUENCE {
@@ -496,6 +558,7 @@ SshKeyToken ::= SEQUENCE {
 	, encuserauth	[3] EncSshKeyUserAuth	OPTIONAL
 	, cctx		[4] EncCtx		OPTIONAL
 	, sctx		[5] EncCtx		OPTIONAL
+	, finished	[6] SshKeyFinished	OPTIONAL
 }
 
 END

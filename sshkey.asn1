@@ -25,6 +25,13 @@ EncCtx ::= SEQUENCE {
 -- possession of the corresponding SSH user private key.  keytype is the SSH
 -- public key algorithm name, key is the raw SSH public key blob, sigtype is
 -- the SSH signature algorithm name, and sig is the SSH signature blob.
+--
+-- User authentication is not a distinct cleartext first-message step.
+-- EncSshKeyUserAuth may appear in any token sent after the sender knows the
+-- peer ECDH public key and can derive the exchange session key.  This lets
+-- initiator-first exchanges keep the username encrypted without adding a
+-- round trip, and lets acceptor-first exchanges carry encrypted userauth in
+-- the initiator's first response.
 
 SshKeyUserAuth ::= SEQUENCE {
 	  username	[0] OCTET STRING
@@ -40,6 +47,8 @@ EncSshKeyUserAuth ::= OCTET STRING
 -- SshKeyHostAuth proves possession of the acceptor host key.  keytype is the
 -- SSH public key algorithm name, key is the raw SSH public key blob, sigtype
 -- is an SSH signature algorithm name, and sig is the SSH signature blob.
+-- The host signature authenticates the acceptor's ECDH contribution and the
+-- associated algorithm and name context.
 
 SshKeyHostAuth ::= SEQUENCE {
 	  keytype	[0] OCTET STRING
@@ -56,15 +65,21 @@ SshKeyHostAuth ::= SEQUENCE {
 -- rsa-sha2-512 signatures.
 --
 -- The initiator should optimistically sign the first encrypted userauth it can
--- produce after the acceptor has returned its signed ECDH public key.  If the
--- acceptor cannot accept that signature algorithm, it returns CONTINUE-NEEDED
--- with an encrypted server context and a narrower sigtypes list.
+-- produce after it has enough ECDH material to derive the session key.  If
+-- the acceptor cannot accept that signature algorithm, it returns
+-- CONTINUE-NEEDED with an encrypted server context and a narrower sigtypes
+-- list.
 --
 -- GSS does not require the initiator to produce the first token.  When
 -- gss_accept_sec_context() is called with no input token, the acceptor sends
 -- the same kind of KEX token as a signed challenge.  The initiator then
 -- returns its KEX public key, the reflected encrypted server context, and
 -- encrypted userauth when available.
+--
+-- HTTP Negotiate is a natural acceptor-first carrier: a server can include an
+-- acceptor-first GSS-SSHKEY token in a 401 WWW-Authenticate header, and the
+-- client can return its KEX public key, encrypted userauth, key confirmation,
+-- and reflected sctx in the Authorization header.
 --
 -- The anonymous ECDH profile derives its base session key using the same
 -- SP800-108 HMAC-SHA256 counter-mode KDF inputs as Heimdal SAnon-X25519:
@@ -94,6 +109,18 @@ SshKeyKEX ::= SEQUENCE {
 	, kextype	[3] OCTET STRING	OPTIONAL
 	, pk		[4] OCTET STRING	OPTIONAL
 	, enctype	[5] OCTET STRING	OPTIONAL
+	, nonce		[6] OCTET STRING	OPTIONAL
+}
+
+--
+-- SshKeyFinished proves knowledge of the session key derived from the ECDH
+-- exchange and transcript.  mac is computed with a key-confirmation key
+-- derived from the exchange session key and covers the transcript hash, role,
+-- and peer nonce.  It is not an SSH signature and does not require another
+-- ssh-agent operation.
+
+SshKeyFinished ::= SEQUENCE {
+	  mac		[0] OCTET STRING
 }
 
 --
@@ -127,6 +154,7 @@ SshKeyToken ::= SEQUENCE {
 	, encuserauth	[3] EncSshKeyUserAuth	OPTIONAL
 	, cctx		[4] EncCtx		OPTIONAL
 	, sctx		[5] EncCtx		OPTIONAL
+	, finished	[6] SshKeyFinished	OPTIONAL
 }
 
 --

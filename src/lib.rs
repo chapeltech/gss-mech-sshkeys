@@ -573,10 +573,12 @@ fn initial_context_token(
         Some(OctetString::from_static(KEX_ALG)),
         Some(OctetString::from(public_key.as_slice())),
         Some(OctetString::from_static(ENC_ALG)),
+        None,
     );
     let token = SshKeyToken::new(
         token_status(SSH_KEY_CONTINUE_NEEDED),
         Some(kex),
+        None,
         None,
         None,
         None,
@@ -599,6 +601,7 @@ fn acceptor_context_token(
         Some(OctetString::from_static(KEX_ALG)),
         Some(OctetString::from(public_key.as_slice())),
         Some(OctetString::from_static(ENC_ALG)),
+        None,
     );
     let token = SshKeyToken::new(
         token_status(SSH_KEY_CONTINUE_NEEDED),
@@ -607,6 +610,7 @@ fn acceptor_context_token(
         None,
         None,
         Some(sctx),
+        None,
     );
 
     rasn::der::encode(&token)
@@ -624,6 +628,7 @@ fn initiator_final_token(
         encuserauth,
         None,
         Some(sctx),
+        None,
     );
 
     rasn::der::encode(&token)
@@ -640,6 +645,7 @@ fn signature_retry_token(
         None,
         None,
         None,
+        None,
     );
     let token = SshKeyToken::new(
         token_status(SSH_KEY_CONTINUE_NEEDED),
@@ -648,6 +654,7 @@ fn signature_retry_token(
         None,
         None,
         Some(sctx),
+        None,
     );
 
     rasn::der::encode(&token)
@@ -2509,6 +2516,7 @@ pub unsafe extern "C" fn gss_init_sec_context(
                 Some(OctetString::from_static(KEX_ALG)),
                 Some(OctetString::from(initiator_public.as_slice())),
                 Some(OctetString::from_static(ENC_ALG)),
+                None,
             ))
         } else {
             None
