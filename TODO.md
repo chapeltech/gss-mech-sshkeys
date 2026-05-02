@@ -27,6 +27,9 @@ publication.  Any protocol-affecting implementation change must update both.
 - Finish the first reusable `rfc4121` crate slice.  The crate now owns wrap
   and MIC token framing, split-token size planning, and the
   `aes256-gcm-sha256` profile used by this mechanism.
+- Add AES RFC4121 crypto profiles.  The `rfc4121` crate now supports the
+  Kerberos AES-CTS/HMAC-SHA1 and AES-CTS/HMAC-SHA2 enctypes, plus private
+  AES-GCM 128-bit and 256-bit profiles for this mechanism family.
 - Add the signed-ECDH builder API scaffold.  The builder now has canonical
   auth and Finished transcripts, signer/verifier traits, ECDH hooks, and
   continuation-state and key-confirmation traits for higher-level mechanisms.
@@ -44,7 +47,7 @@ publication.  Any protocol-affecting implementation change must update both.
    - RFC4121 per-message layer: the mechanism implements
      `gss_init_sec_context()` and `gss_accept_sec_context()`, derives or
      receives a session key, implements a `CryptoProfile`, and lets the builder
-     export `gss_wrap()`, `gss_unwrap()`, IOV entrypoints, and eventually MIC.
+     export `gss_wrap()`, `gss_unwrap()`, IOV entrypoints, and MIC.
    - Signed-ECDH mechanism layer: the builder owns ephemeral ECDH generation,
      canonical signed transcripts, client-first and acceptor-first tokens,
      encrypted acceptor continuation state, Finished MAC key confirmation, and
@@ -69,9 +72,9 @@ publication.  Any protocol-affecting implementation change must update both.
 
 4. Replace remaining OpenSSL FFI where practical.
 
-   X25519, HMAC-SHA256, and AES-256-GCM still use direct OpenSSL FFI.  Evaluate
-   RustCrypto crates or idiomatic bindings while preserving interoperability
-   and avoiding private Heimdal APIs.
+   X25519 and handshake/context-state crypto helpers still use direct OpenSSL
+   FFI.  Evaluate RustCrypto crates or idiomatic bindings while preserving
+   interoperability and avoiding private Heimdal APIs.
 
 5. Harden encrypted context state.
 

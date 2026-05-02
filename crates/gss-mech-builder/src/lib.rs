@@ -606,7 +606,14 @@ pub unsafe fn wrap_size_limit<C: Rfc4121Context>(
 ) -> OM_uint32 {
     if !max_input_size.is_null() {
         let overhead =
-            rfc4121::HEADER_LEN + trailer_len::<C>(conf_req_flag != 0);
+            match rfc4121::buffer_plan::<C::Profile>(0, conf_req_flag != 0) {
+                Ok(plan) => plan.header_len + plan.trailer_len,
+                Err(status) => {
+                    let status = rfc4121_status(status);
+                    set_minor(minor, status.minor);
+                    return status.major;
+                }
+            };
         *max_input_size = req_output_size.saturating_sub(overhead as u32);
     }
     set_minor(minor, 0);

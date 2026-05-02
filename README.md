@@ -39,7 +39,8 @@ Implemented so far:
 - Encrypted stateless acceptor context returned through `sctx`.
 - Client-first and acceptor-first context establishment.
 - Reusable `rfc4121` crate for wrap and MIC token framing, sequence handling,
-  split-token size planning, and the `aes256-gcm-sha256` profile.
+  split-token size planning, Kerberos AES-CTS/HMAC-SHA1 and
+  AES-CTS/HMAC-SHA2 profiles, and private AES-GCM profiles.
 - Initial `gss-mech-builder` crate for GSS ABI definitions, RFC4121
   per-message scaffolding, and signed-ECDH handshake scaffolding.
 - RFC 4121-style per-message wrapping with `gss_wrap`,
