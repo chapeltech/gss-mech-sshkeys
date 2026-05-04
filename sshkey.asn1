@@ -97,7 +97,7 @@ SshKeyHostAuth ::= SEQUENCE {
 -- SSHKEY uses RFC 4121 CFX token framing for per-message tokens, but it is a
 -- new mechanism and does not support Kerberos DES, Triple-DES, RC4, or other
 -- legacy RFC 4121 encryption types.  The current enctype profile is
--- aes256-gcm-sha256.
+-- aes128-cts-hmac-sha256-128.
 
 SshKeyKEX ::= SEQUENCE {
 	-- Negotiation part

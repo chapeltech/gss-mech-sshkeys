@@ -340,7 +340,7 @@ mod tests {
             nonce: b"nonce".to_vec(),
             algorithms: AlgorithmSuite {
                 kex: vec![b"curve25519-sha256".to_vec()],
-                enctype: vec![b"aes256-gcm-sha256".to_vec()],
+                enctype: vec![b"aes128-cts-hmac-sha256-128".to_vec()],
                 signature: vec![
                     b"rsa-sha2-512".to_vec(),
                     b"ssh-ed25519".to_vec(),

@@ -22,6 +22,7 @@ use gss_mech_builder::{
 };
 use hmac::{Hmac, Mac};
 use rasn::types::{Integer, OctetString};
+use rfc4121::CryptoProfile;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use signature::{Signer, Verifier};
@@ -51,24 +52,11 @@ struct EVP_PKEY_CTX {
 }
 
 #[repr(C)]
-struct EVP_CIPHER {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-struct EVP_CIPHER_CTX {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
 struct EVP_MD {
     _private: [u8; 0],
 }
 
 const EVP_PKEY_X25519: c_int = 1034;
-const EVP_CTRL_GCM_SET_IVLEN: c_int = 0x9;
-const EVP_CTRL_GCM_GET_TAG: c_int = 0x10;
-const EVP_CTRL_GCM_SET_TAG: c_int = 0x11;
 
 const SSH_KEY_COMPLETE: u8 = 1;
 const SSH_KEY_CONTINUE_NEEDED: u8 = 2;
@@ -77,7 +65,7 @@ static SSHKEY_OID_ELEMENTS: [u8; 9] =
     [0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x01];
 
 const KEX_ALG: &[u8] = b"curve25519-sha256";
-const ENC_ALG: &[u8] = b"aes256-gcm-sha256";
+const ENC_ALG: &[u8] = b"aes128-cts-hmac-sha256-128";
 const SIG_ALGS: &[u8] = b"ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,\
 ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-dss";
 const SANON_KDF_LABEL: &[u8] = b"sanon-x25519";
@@ -85,11 +73,18 @@ const SANON_SESSION_KEY_LEN: usize = 16;
 const X25519_PUBLIC_LEN: usize = 32;
 const X25519_SHARED_LEN: usize = 32;
 const CONTEXT_KEY_LEN: usize = 32;
+const PRIVATE_SEAL_KEY_LEN: usize = 16;
 #[cfg(test)]
 const CFX_HEADER_LEN: usize = rfc4121::HEADER_LEN;
+#[cfg(test)]
+const CFX_SEALED_HEADER_LEN: usize =
+    CFX_HEADER_LEN + rfc4121::AES_CTS_CONFOUNDER_LEN;
+#[cfg(test)]
+const CFX_SEALED_TRAILER_LEN: usize =
+    CFX_HEADER_LEN + rfc4121::AES128_SHA2_CHECKSUM_LEN;
+#[cfg(test)]
+const CFX_CHECKSUM_LEN: usize = rfc4121::AES128_SHA2_CHECKSUM_LEN;
 const CFX_HMAC_LEN: usize = 32;
-const CFX_GCM_TAG_LEN: usize = 16;
-const CFX_GCM_NONCE_LEN: usize = 12;
 const HANDSHAKE_NONCE_LEN: usize = 32;
 const SERVER_CONTEXT_LABEL: &[u8] = b"SSHKEY server context v1";
 const USERAUTH_LABEL: &[u8] = b"SSHKEY userauth v1";
@@ -182,53 +177,6 @@ unsafe extern "C" {
         md: *mut c_uchar,
         md_len: *mut c_uint,
     ) -> *mut c_uchar;
-    fn EVP_CIPHER_CTX_new() -> *mut EVP_CIPHER_CTX;
-    fn EVP_CIPHER_CTX_free(ctx: *mut EVP_CIPHER_CTX);
-    fn EVP_aes_256_gcm() -> *const EVP_CIPHER;
-    fn EVP_EncryptInit_ex(
-        ctx: *mut EVP_CIPHER_CTX,
-        cipher: *const EVP_CIPHER,
-        engine: *mut c_void,
-        key: *const c_uchar,
-        iv: *const c_uchar,
-    ) -> c_int;
-    fn EVP_EncryptUpdate(
-        ctx: *mut EVP_CIPHER_CTX,
-        out: *mut c_uchar,
-        outl: *mut c_int,
-        input: *const c_uchar,
-        inl: c_int,
-    ) -> c_int;
-    fn EVP_EncryptFinal_ex(
-        ctx: *mut EVP_CIPHER_CTX,
-        out: *mut c_uchar,
-        outl: *mut c_int,
-    ) -> c_int;
-    fn EVP_DecryptInit_ex(
-        ctx: *mut EVP_CIPHER_CTX,
-        cipher: *const EVP_CIPHER,
-        engine: *mut c_void,
-        key: *const c_uchar,
-        iv: *const c_uchar,
-    ) -> c_int;
-    fn EVP_DecryptUpdate(
-        ctx: *mut EVP_CIPHER_CTX,
-        out: *mut c_uchar,
-        outl: *mut c_int,
-        input: *const c_uchar,
-        inl: c_int,
-    ) -> c_int;
-    fn EVP_DecryptFinal_ex(
-        ctx: *mut EVP_CIPHER_CTX,
-        out: *mut c_uchar,
-        outl: *mut c_int,
-    ) -> c_int;
-    fn EVP_CIPHER_CTX_ctrl(
-        ctx: *mut EVP_CIPHER_CTX,
-        ctrl_type: c_int,
-        arg: c_int,
-        ptr: *mut c_void,
-    ) -> c_int;
 }
 
 #[link(name = "resolv")]
@@ -1218,33 +1166,42 @@ unsafe fn derive_context_key(
     hmac_sha256(session_key, label)
 }
 
-unsafe fn seal_aead(
+unsafe fn private_seal_key(
+    key: &[u8; CONTEXT_KEY_LEN],
+    label: &[u8],
+) -> Option<[u8; PRIVATE_SEAL_KEY_LEN]> {
+    let digest = hmac_sha256(key, label)?;
+    let mut out = [0u8; PRIVATE_SEAL_KEY_LEN];
+    out.copy_from_slice(&digest[..PRIVATE_SEAL_KEY_LEN]);
+    Some(out)
+}
+
+unsafe fn seal_private(
     key: &[u8; CONTEXT_KEY_LEN],
     label: &[u8],
     plaintext: &[u8],
 ) -> Option<Vec<u8>> {
-    let mut nonce = [0u8; CFX_GCM_NONCE_LEN];
-    if !fill_random(&mut nonce) {
-        return None;
-    }
-    let body = aes_256_gcm_encrypt(key, &nonce, label, plaintext)?;
-    let mut out = Vec::with_capacity(nonce.len() + body.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&body);
-    Some(out)
+    let profile =
+        rfc4121::Aes128CtsHmacSha256_128Profile::new(private_seal_key(
+            key, label,
+        )?);
+    profile
+        .seal(rfc4121::Role::Initiator, 0, label, plaintext)
+        .ok()
 }
 
-unsafe fn open_aead(
+unsafe fn open_private(
     key: &[u8; CONTEXT_KEY_LEN],
     label: &[u8],
     ciphertext: &[u8],
 ) -> Option<Vec<u8>> {
-    if ciphertext.len() < CFX_GCM_NONCE_LEN + CFX_GCM_TAG_LEN {
-        return None;
-    }
-    let (nonce, body) = ciphertext.split_at(CFX_GCM_NONCE_LEN);
-    let nonce = nonce.try_into().ok()?;
-    aes_256_gcm_decrypt(key, nonce, label, body)
+    let profile =
+        rfc4121::Aes128CtsHmacSha256_128Profile::new(private_seal_key(
+            key, label,
+        )?);
+    profile
+        .open(rfc4121::Role::Initiator, 0, label, ciphertext)
+        .ok()
 }
 
 unsafe fn seal_userauth(
@@ -1252,7 +1209,7 @@ unsafe fn seal_userauth(
     plaintext: &[u8],
 ) -> Option<Vec<u8>> {
     let key = derive_context_key(session_key, USERAUTH_LABEL)?;
-    seal_aead(&key, USERAUTH_LABEL, plaintext)
+    seal_private(&key, USERAUTH_LABEL, plaintext)
 }
 
 unsafe fn open_userauth(
@@ -1260,7 +1217,7 @@ unsafe fn open_userauth(
     ciphertext: &[u8],
 ) -> Option<Vec<u8>> {
     let key = derive_context_key(session_key, USERAUTH_LABEL)?;
-    open_aead(&key, USERAUTH_LABEL, ciphertext)
+    open_private(&key, USERAUTH_LABEL, ciphertext)
 }
 
 unsafe fn seal_server_context(
@@ -1268,14 +1225,14 @@ unsafe fn seal_server_context(
 ) -> Option<Vec<u8>> {
     let plaintext = rasn::der::encode(context).ok()?;
     let key = server_context_key();
-    seal_aead(&key, SERVER_CONTEXT_LABEL, &plaintext)
+    seal_private(&key, SERVER_CONTEXT_LABEL, &plaintext)
 }
 
 unsafe fn open_server_context(
     ciphertext: &[u8],
 ) -> Option<SshKeyServerContext> {
     let key = server_context_key();
-    let plaintext = open_aead(&key, SERVER_CONTEXT_LABEL, ciphertext)?;
+    let plaintext = open_private(&key, SERVER_CONTEXT_LABEL, ciphertext)?;
     rasn::der::decode::<SshKeyServerContext>(&plaintext).ok()
 }
 
@@ -1557,162 +1514,6 @@ unsafe fn sp800_108_hmac_sha256<const N: usize>(
     Some(out)
 }
 
-unsafe fn aes_256_gcm_encrypt(
-    key: &[u8; CFX_HMAC_LEN],
-    nonce: &[u8; CFX_GCM_NONCE_LEN],
-    aad: &[u8],
-    plaintext: &[u8],
-) -> Option<Vec<u8>> {
-    let aad_len: c_int = aad.len().try_into().ok()?;
-    let input_len: c_int = plaintext.len().try_into().ok()?;
-    let ctx = EVP_CIPHER_CTX_new();
-    if ctx.is_null() {
-        return None;
-    }
-
-    let mut out = vec![0u8; plaintext.len()];
-    let mut len = 0;
-    let mut total = 0usize;
-    let mut tag = [0u8; CFX_GCM_TAG_LEN];
-    let ok = EVP_EncryptInit_ex(
-        ctx,
-        EVP_aes_256_gcm(),
-        ptr::null_mut(),
-        ptr::null(),
-        ptr::null(),
-    ) == 1
-        && EVP_CIPHER_CTX_ctrl(
-            ctx,
-            EVP_CTRL_GCM_SET_IVLEN,
-            CFX_GCM_NONCE_LEN as c_int,
-            ptr::null_mut(),
-        ) == 1
-        && EVP_EncryptInit_ex(
-            ctx,
-            ptr::null(),
-            ptr::null_mut(),
-            key.as_ptr(),
-            nonce.as_ptr(),
-        ) == 1
-        && (aad.is_empty()
-            || EVP_EncryptUpdate(
-                ctx,
-                ptr::null_mut(),
-                &mut len,
-                aad.as_ptr(),
-                aad_len,
-            ) == 1)
-        && EVP_EncryptUpdate(
-            ctx,
-            out.as_mut_ptr(),
-            &mut len,
-            plaintext.as_ptr(),
-            input_len,
-        ) == 1;
-    if ok {
-        total = len as usize;
-    }
-    let ok = ok
-        && EVP_EncryptFinal_ex(ctx, out.as_mut_ptr().add(total), &mut len) == 1;
-    if ok {
-        total += len as usize;
-    }
-    let ok = ok
-        && EVP_CIPHER_CTX_ctrl(
-            ctx,
-            EVP_CTRL_GCM_GET_TAG,
-            CFX_GCM_TAG_LEN as c_int,
-            tag.as_mut_ptr().cast(),
-        ) == 1;
-    EVP_CIPHER_CTX_free(ctx);
-
-    if !ok {
-        return None;
-    }
-    out.truncate(total);
-    out.extend_from_slice(&tag);
-    Some(out)
-}
-
-unsafe fn aes_256_gcm_decrypt(
-    key: &[u8; CFX_HMAC_LEN],
-    nonce: &[u8; CFX_GCM_NONCE_LEN],
-    aad: &[u8],
-    ciphertext_and_tag: &[u8],
-) -> Option<Vec<u8>> {
-    if ciphertext_and_tag.len() < CFX_GCM_TAG_LEN {
-        return None;
-    }
-
-    let (ciphertext, tag) =
-        ciphertext_and_tag.split_at(ciphertext_and_tag.len() - CFX_GCM_TAG_LEN);
-    let aad_len: c_int = aad.len().try_into().ok()?;
-    let input_len: c_int = ciphertext.len().try_into().ok()?;
-    let ctx = EVP_CIPHER_CTX_new();
-    if ctx.is_null() {
-        return None;
-    }
-
-    let mut out = vec![0u8; ciphertext.len()];
-    let mut len = 0;
-    let mut total = 0usize;
-    let ok = EVP_DecryptInit_ex(
-        ctx,
-        EVP_aes_256_gcm(),
-        ptr::null_mut(),
-        ptr::null(),
-        ptr::null(),
-    ) == 1
-        && EVP_CIPHER_CTX_ctrl(
-            ctx,
-            EVP_CTRL_GCM_SET_IVLEN,
-            CFX_GCM_NONCE_LEN as c_int,
-            ptr::null_mut(),
-        ) == 1
-        && EVP_DecryptInit_ex(
-            ctx,
-            ptr::null(),
-            ptr::null_mut(),
-            key.as_ptr(),
-            nonce.as_ptr(),
-        ) == 1
-        && (aad.is_empty()
-            || EVP_DecryptUpdate(
-                ctx,
-                ptr::null_mut(),
-                &mut len,
-                aad.as_ptr(),
-                aad_len,
-            ) == 1)
-        && EVP_DecryptUpdate(
-            ctx,
-            out.as_mut_ptr(),
-            &mut len,
-            ciphertext.as_ptr(),
-            input_len,
-        ) == 1;
-    if ok {
-        total = len as usize;
-    }
-
-    let ok = ok
-        && EVP_CIPHER_CTX_ctrl(
-            ctx,
-            EVP_CTRL_GCM_SET_TAG,
-            CFX_GCM_TAG_LEN as c_int,
-            tag.as_ptr() as *mut c_void,
-        ) == 1
-        && EVP_DecryptFinal_ex(ctx, out.as_mut_ptr().add(total), &mut len) == 1;
-    EVP_CIPHER_CTX_free(ctx);
-
-    if !ok {
-        return None;
-    }
-    total += len as usize;
-    out.truncate(total);
-    Some(out)
-}
-
 #[cfg(test)]
 unsafe fn cfx_wrap_message(
     ctx: &mut SshKeyCtx,
@@ -1722,7 +1523,7 @@ unsafe fn cfx_wrap_message(
     cfx_wrap_message_with_aad(ctx, conf_req, plaintext, &[])
 }
 
-type SshKeyRfc4121Profile = rfc4121::Aes256GcmSha256Profile;
+type SshKeyRfc4121Profile = rfc4121::Aes128CtsHmacSha256_128Profile;
 
 impl Rfc4121Context for SshKeyCtx {
     type Profile = SshKeyRfc4121Profile;
@@ -3732,7 +3533,7 @@ mod tests {
                 cfx_wrap_message(&mut initiator, false, b"signed").unwrap();
 
             assert!(!sealed);
-            assert_eq!(token[4..6], (CFX_HMAC_LEN as u16).to_be_bytes());
+            assert_eq!(token[4..6], (CFX_CHECKSUM_LEN as u16).to_be_bytes());
             *token.last_mut().unwrap() ^= 0x01;
 
             assert_eq!(
@@ -3809,8 +3610,8 @@ mod tests {
             let (mut initiator, mut acceptor) = cfx_test_contexts();
             let original = b"iov sealed message";
             let mut data = original.to_vec();
-            let mut header = [0u8; CFX_HEADER_LEN];
-            let mut trailer = [0u8; CFX_HEADER_LEN + CFX_GCM_TAG_LEN];
+            let mut header = [0u8; CFX_SEALED_HEADER_LEN];
+            let mut trailer = [0u8; CFX_SEALED_TRAILER_LEN];
             let mut iovs = [
                 gss_iov_buffer_desc {
                     type_: GSS_IOV_BUFFER_TYPE_HEADER,
@@ -3850,8 +3651,8 @@ mod tests {
                 GSS_S_COMPLETE
             );
             assert_eq!(conf_state, 1);
-            assert_eq!(iovs[0].buffer.length, CFX_HEADER_LEN);
-            assert_eq!(iovs[2].buffer.length, CFX_HEADER_LEN + CFX_GCM_TAG_LEN);
+            assert_eq!(iovs[0].buffer.length, CFX_SEALED_HEADER_LEN);
+            assert_eq!(iovs[2].buffer.length, CFX_SEALED_TRAILER_LEN);
 
             assert_eq!(
                 gss_unwrap_iov(
@@ -3876,8 +3677,8 @@ mod tests {
             let original = b"iov sealed message";
             let mut aad = b"metadata".to_vec();
             let mut data = original.to_vec();
-            let mut header = [0u8; CFX_HEADER_LEN];
-            let mut trailer = [0u8; CFX_HEADER_LEN + CFX_GCM_TAG_LEN];
+            let mut header = [0u8; CFX_SEALED_HEADER_LEN];
+            let mut trailer = [0u8; CFX_SEALED_TRAILER_LEN];
             let mut iovs = [
                 gss_iov_buffer_desc {
                     type_: GSS_IOV_BUFFER_TYPE_HEADER,

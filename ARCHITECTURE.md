@@ -23,9 +23,9 @@ Generated ASN.1 files are build artifacts and must not be committed.
 The current crypto implementation is mixed:
 
 - OpenSSL FFI is still used for X25519, handshake KDF/MAC helpers, and
-  encrypted acceptor continuation state.
-- The `rfc4121` crate uses RustCrypto `aes`, `aes-gcm`, `hmac`, `sha1`, and
-  `sha2` for RFC4121-style per-message services.
+  acceptor continuation state helpers.
+- The `rfc4121` crate uses RustCrypto `aes`, `hmac`, `sha1`, and `sha2` for
+  RFC4121-style per-message services.
 - The `ssh-key` and `signature` crates are used for SSH public key and
   signature blob handling.
 

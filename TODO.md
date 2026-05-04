@@ -25,11 +25,10 @@ publication.  Any protocol-affecting implementation change must update both.
   mechanism now implements the builder's RFC4121 context trait and delegates
   `gss_wrap()`, `gss_unwrap()`, and IOV entrypoints to the builder.
 - Finish the first reusable `rfc4121` crate slice.  The crate now owns wrap
-  and MIC token framing, split-token size planning, and the
-  `aes256-gcm-sha256` profile used by this mechanism.
+  and MIC token framing, split-token size planning, and a standards-track
+  AES-CTS/HMAC profile used by this mechanism.
 - Add AES RFC4121 crypto profiles.  The `rfc4121` crate now supports the
-  Kerberos AES-CTS/HMAC-SHA1 and AES-CTS/HMAC-SHA2 enctypes, plus private
-  AES-GCM 128-bit and 256-bit profiles for this mechanism family.
+  Kerberos AES-CTS/HMAC-SHA1 and AES-CTS/HMAC-SHA2 enctypes.
 - Add the signed-ECDH builder API scaffold.  The builder now has canonical
   auth and Finished transcripts, signer/verifier traits, ECDH hooks, and
   continuation-state and key-confirmation traits for higher-level mechanisms.
