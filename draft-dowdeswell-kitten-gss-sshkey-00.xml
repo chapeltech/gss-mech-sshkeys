@@ -14,8 +14,11 @@
     <author initials="R." surname="Dowdeswell"
             fullname="Roland C. Dowdeswell">
       <organization/>
+      <address>
+        <email>elric@imrryr.org</email>
+      </address>
     </author>
-    <date year="2026" month="April" day="29"/>
+    <date year="2026" month="August" day="20"/>
     <area>Security</area>
     <workgroup>Kitten Working Group</workgroup>
     <keyword>GSS-API</keyword>
@@ -68,28 +71,48 @@
         knowledge of the derived session key.
       </t>
       <t>
-        Context-establishment tokens are DER encodings of the ASN.1
-        SshKeyToken type defined in <xref target="asn1"/>.  Per-message
+        Context-establishment token values are DER encodings of the ASN.1
+        SshKeyToken type defined in <xref target="asn1"/>.  The initial
+        initiator token is encapsulated as specified below.  Per-message
         tokens use the GSS-API CFX token framing described in
-        <xref target="RFC4121"/>, with keys derived by this mechanism
-        instead of by Kerberos.
+        <xref target="RFC4121"/>, with keys derived by this mechanism instead
+        of by Kerberos.
       </t>
     </section>
 
     <section anchor="identity">
       <name>Mechanism Identity</name>
       <t>
-        The experimental mechanism OID is:
+        IANA is requested to assign the permanent GSS-SSHKEY mechanism OID
+        from the iso.org.dod.internet.security.mechanisms arc as described in
+        <xref target="iana"/>:
+      </t>
+      <sourcecode type="asn.1"><![CDATA[
+sshkey OBJECT IDENTIFIER ::=
+    { iso(1) org(3) dod(6) internet(1) security(5)
+      mechanisms(5) TBD1 }
+]]></sourcecode>
+      <t>
+        RFC Editor: replace TBD1 above with the value assigned by IANA and
+        remove this note.
+      </t>
+      <t>
+        Until that assignment is made, implementation experiments associated
+        with this draft use the following private OID:
       </t>
       <sourcecode type="text"><![CDATA[
 1.3.6.1.4.1.99999.1
 ]]></sourcecode>
       <t>
-        The corresponding DER OID contents octets are:
+        The corresponding temporary DER OID contents octets are:
       </t>
       <sourcecode type="text"><![CDATA[
 2b 06 01 04 01 86 8d 1f 01
 ]]></sourcecode>
+      <t>
+        This private OID is not the value requested from IANA and MUST NOT be
+        used for interoperable deployment.
+      </t>
       <t>
         The SASL mechanism name for use by implementations that expose a
         SASL name is "SSHKEY".
@@ -103,6 +126,28 @@
         host-based service name.  The service component identifies the
         application service, and the host component identifies the SSH host
         key namespace in which the acceptor key is validated.
+      </t>
+      <t>
+        The canonical acceptor name is the service component, an at sign,
+        and the effective destination hostname after client configuration
+        resolution.  The hostname is converted to lowercase and a trailing
+        root dot is removed.  This value is carried as acceptorName and is
+        bound into host authentication, user authentication, and key
+        confirmation.
+      </t>
+      <t>
+        The username field in SshKeyUserAuth is the requested local account
+        selected by application or SSH client configuration.  Successful key
+        authorization authenticates that account, and the accepted GSS source
+        name and its display form are the exact username octets.  The SSH key
+        proves authorization for the account; its fingerprint is not the GSS
+        source name.
+      </t>
+      <t>
+        The exported name is the RFC 2743 exported-name token for this
+        mechanism OID with the username as the mechanism name payload.
+        gss_localname() and gss_authorize_localname() therefore map and
+        authorize that same requested account name.
       </t>
       <t>
         The acceptor credential consists of one or more SSH host private
@@ -123,13 +168,49 @@
       </t>
     </section>
 
+    <section anchor="authorization-context">
+      <name>Authorization and Network Identity</name>
+      <t>
+        The GSS-API context-establishment interface does not provide this
+        mechanism with an authenticated network hostname or address for the
+        initiator.  Address fields supplied as GSS channel bindings bind
+        application-provided values to the context; they do not define those
+        values as initiator authorization identities.
+      </t>
+      <t>
+        The initiator MAY use the target name and client configuration to
+        select the destination hostname and host-key policy.  The acceptor
+        MAY use its own local hostname while parsing local configuration.
+        Neither value is the initiator's hostname at the acceptor.
+      </t>
+      <t>
+        An acceptor implementing this profile MUST NOT use a DNS hostname for
+        the initiator in an authorization decision.  It MUST NOT obtain such
+        a name through reverse DNS, accept one asserted by the initiator, or
+        treat a numeric peer address as a hostname.  If local authorization
+        policy depends on an initiator hostname, authentication MUST fail
+        closed for that policy rather than treating the condition as
+        unmatched.
+      </t>
+      <t>
+        An embedding application MAY provide a numeric source address that
+        its transport observed for the connection through a local
+        implementation interface.  Address-dependent authorization policy
+        MAY be evaluated only when that address is available.  If it is not
+        available and the result could affect authorization, authentication
+        MUST fail closed.
+      </t>
+    </section>
+
     <section anchor="encoding">
       <name>Token Encoding</name>
       <t>
-        All context-establishment tokens exchanged by
-        gss_init_sec_context() and gss_accept_sec_context() are DER
-        encodings of SshKeyToken.  Implementations MUST reject tokens that
-        are not valid DER encodings of that type.
+        Every SshKeyToken value is DER encoded.  When the initiator begins an
+        exchange, its first token MUST be wrapped in the InitialContextToken
+        framing from Section 3.1 of <xref target="RFC2743"/> for this mechanism
+        OID.  An initiator responding to an acceptor-first token and all
+        subsequent tokens send raw DER.  Implementations MUST reject malformed
+        framing and values that are not valid DER encodings of SshKeyToken.
       </t>
       <t>
         Algorithm-list fields are OCTET STRING values containing SSH
@@ -139,20 +220,17 @@
         <xref target="RFC4252"/> and <xref target="RFC4253"/>.
       </t>
       <t>
-        Encrypted OCTET STRING fields contain an SSH binary packet with the
-        following fields:
+        EncSshKeyUserAuth and EncCtx.encPart contain the profile ciphertext C
+        followed immediately by its 16-octet integrity checksum H:
       </t>
       <sourcecode type="text"><![CDATA[
-string  enctype
-string  nonce
-string  ciphertext
+C || H
 ]]></sourcecode>
       <t>
-        For an AEAD enctype, ciphertext includes the authentication tag in
-        the enctype-defined form.  The associated data is the DER encoding
-        of the enclosing SshKeyToken with the encrypted OCTET STRING value
-        replaced by an empty OCTET STRING, followed by the signature
-        transcript fields defined in <xref target="transcript"/>.
+        These fields do not repeat the negotiated enctype and do not carry an
+        explicit nonce.  The profile prepends a random 16-octet confounder to
+        the DER plaintext before encryption.  The field-specific labels and
+        key derivation are defined in <xref target="transcript"/>.
       </t>
     </section>
 
@@ -172,10 +250,11 @@ string  ciphertext
         rsa-sha2-512, rsa-sha2-256, or legacy ssh-rsa signatures.
       </t>
       <t>
-        Implementations of this draft SHOULD support curve25519-sha256 for
-        key exchange, aes256-gcm-sha256 for encrypted fields and
-        per-message tokens, and ssh-ed25519 for signatures.  Curve25519 is
-        described in <xref target="RFC7748"/>.
+        Implementations of this version MUST support curve25519-sha256 for key
+        exchange and aes128-cts-hmac-sha256-128 for encrypted fields and
+        per-message tokens.  They SHOULD support ssh-ed25519 for signatures.
+        Curve25519 is described in <xref target="RFC7748"/>.  The encryption
+        profile is based on <xref target="RFC8009"/> as specified below.
       </t>
       <t>
         This mechanism is new and has no compatibility requirement for
@@ -186,6 +265,32 @@ string  ciphertext
 
     <section anchor="transcript">
       <name>Signature Transcripts and Key Schedule</name>
+      <t>
+        canonical-channel-bindings is a deterministic encoding of the GSS
+        channel bindings supplied by the application.  No channel bindings
+        are encoded as the single octet 0x00.  A present channel-binding
+        structure is encoded as:
+      </t>
+      <sourcecode type="text"><![CDATA[
+0x01 ||
+uint32le(initiator-address-type) ||
+uint32le(length(initiator-address)) || initiator-address ||
+uint32le(acceptor-address-type) ||
+uint32le(length(acceptor-address)) || acceptor-address ||
+uint32le(length(application-data)) || application-data
+]]></sourcecode>
+      <t>
+        This field order and little-endian integer encoding follow the
+        channel-binding hash input defined by <xref target="RFC4121"/>.
+        Zero-valued lengths are included.  The leading presence octet
+        distinguishes no bindings from a present structure with empty
+        buffers.  An implementation MUST reject a component whose length
+        cannot be represented in 32 bits.  The same canonical value MUST be
+        supplied on every call for one local context; a change MUST fail with
+        GSS_S_BAD_BINDINGS.  GSS_C_CHANNEL_BOUND_FLAG is set only after a
+        present structure has been used by a successfully established
+        context.
+      </t>
       <t>
         Signature inputs are encoded as SSH strings as defined by
         <xref target="RFC4251"/>.  In the initiator-first flow, the host
@@ -203,7 +308,7 @@ SSH-string(acceptor-ecdh-public-key) ||
 SSH-string(initiator-nonce) ||
 SSH-string(acceptor-nonce) ||
 SSH-string(acceptor-name) ||
-SSH-string(channel-binding-application-data)
+SSH-string(canonical-channel-bindings)
 ]]></sourcecode>
       <t>
         In the acceptor-first flow, the host challenge signature input is:
@@ -217,7 +322,7 @@ SSH-string(acceptor-signature-algorithms) ||
 SSH-string(acceptor-ecdh-public-key) ||
 SSH-string(acceptor-nonce) ||
 SSH-string(acceptor-name) ||
-SSH-string(channel-binding-application-data)
+SSH-string(canonical-channel-bindings)
 ]]></sourcecode>
       <t>
         The user signature input is:
@@ -238,7 +343,7 @@ SSH-string(username) ||
 SSH-string(user-public-key-type) ||
 SSH-string(user-public-key-blob) ||
 SSH-string(user-signature-algorithm) ||
-SSH-string(channel-binding-application-data)
+SSH-string(canonical-channel-bindings)
 ]]></sourcecode>
       <t>
         EncSshKeyUserAuth is not tied to a single final user-authentication
@@ -258,15 +363,40 @@ K_base = KDF(
   K1      = Z,
   label   = "sanon-x25519",
   context = initiator-pk || acceptor-pk || uint32(0) ||
-            uint32(flags) || channel-binding-application-data,
+            uint32(flags) || canonical-channel-bindings,
   L       = 128
 )
 ]]></sourcecode>
       <t>
         This version sends no SAnon-style optional protocol flags, so flags
-        is zero.  Directional per-message keys are derived from K_base using
-        mechanism-specific HMAC-SHA256 labels.  Nonces MUST NOT repeat for a
-        given key and MUST include monotonically increasing sequence numbers.
+        is zero.  K_base is the 128-bit protocol key for the RFC 8009
+        AES128-CTS-HMAC-SHA256-128 profile.  Per-message encryption and
+        integrity keys are derived from it using the RFC 8009 key-usage
+        constants selected by the RFC 4121 sender role and token operation.
+      </t>
+      <t>
+        Private encrypted fields use the same AES and HMAC primitives with the
+        fixed RFC 4121 initiator-seal key usage 24.  Let label be "SSHKEY
+        userauth v1" for EncSshKeyUserAuth or "SSHKEY server context v1" for
+        sctx.  Their 128-bit profile keys are:
+      </t>
+      <sourcecode type="text"><![CDATA[
+K_userauth = first-128-bits(HMAC-SHA-256(
+  HMAC-SHA-256(K_base, "SSHKEY userauth v1"),
+  "SSHKEY userauth v1"))
+
+K_sctx = first-128-bits(HMAC-SHA-256(
+  K_context, "SSHKEY server context v1"))
+]]></sourcecode>
+      <t>
+        K_context is a local 256-bit acceptor context-protection key shared by
+        acceptor processes that consume sctx.  It is not derived from or sent
+        to the peer.  For either field, RFC 8009 derives Ke with constant
+        0x00000018AA and Ki with constant 0x0000001855.  Encryption applies
+        AES CBC ciphertext stealing to a fresh random 16-octet confounder
+        followed by the DER plaintext.  The profile's integrity input is
+        label || 16 zero octets || C, extending RFC 8009 with the field label
+        as associated data.  H is the first 128 bits of HMAC-SHA-256 under Ki.
       </t>
       <t>
         Key confirmation uses a finished key derived from K_base and the
@@ -275,6 +405,58 @@ K_base = KDF(
         the ECDH-derived session key and does not require an additional SSH
         signature or SSH agent operation.
       </t>
+      <t>
+        A user-authentication retry uses a distinct transcript hash:
+      </t>
+      <sourcecode type="text"><![CDATA[
+SHA-256(
+  SSH-string("gss-sshkey userauth retry v1") ||
+  SSH-string(mechanism-oid-der-contents) ||
+  SSH-string(original-handshake-transcript-hash) ||
+  SSH-string(rejected-encuserauth) ||
+  SSH-string(sctx)
+)
+]]></sourcecode>
+      <t>
+        The acceptor computes SshKeyFinished for that hash with the distinct
+        role label "gss-sshkey acceptor retry v1" and the initiator nonce.
+        This binds the retry to the session, the exact rejected attempt, and
+        the reflected acceptor state.  The initiator MUST verify this value
+        before selecting another user key or signature algorithm.
+      </t>
+    </section>
+
+    <section anchor="vectors">
+      <name>Protocol Vectors</name>
+      <t>
+        This vector fixes the DER and transcript encodings.  Byte ranges use
+        inclusive hexadecimal endpoints.  Its inputs are:
+      </t>
+      <sourcecode type="text"><![CDATA[
+mechanism-oid-der-contents = 2b06010401868d1f01
+initiator-signature-algorithms = "ssh-ed25519,rsa-sha2-512"
+acceptor-signature-algorithms = "ssh-ed25519"
+initiator-ecdh-public-key = 00..1f
+acceptor-ecdh-public-key = 20..3f
+initiator-nonce = 40..5f
+acceptor-nonce = 60..7f
+acceptor-name = "sshkey@host.example"
+canonical-channel-bindings = 00
+username = "alice"
+user-public-key-type = "ssh-ed25519"
+user-public-key-blob = 00010203
+user-signature-algorithm = "ssh-ed25519"
+user-signature-blob = 040506
+]]></sourcecode>
+      <t>
+        DER(SshKeyUserAuth), the handshake transcript hash, and SHA-256 of the
+        complete user signature input are, respectively:
+      </t>
+      <sourcecode type="text"><![CDATA[
+302c8005616c696365810b7373682d65643235353139820400010203830b7373682d656432353531398403040506
+5c85ea298b49f648864af914d4288b3e1c36047ffafc8c8b48d5076d401b1cd3
+f33be51710e22ab7abf383c87f5ca999f9f104d5a85267d3b67ed3057d4450ff
+]]></sourcecode>
     </section>
 
     <section anchor="flow">
@@ -286,10 +468,11 @@ K_base = KDF(
           SSH-KEY-CONTINUE-NEEDED and a SshKeyKEX value.  The kextypes,
           enctypes, and sigtypes fields contain the initiator algorithm
           lists.  The kextype, enctype, and pk fields SHOULD contain the
-          initiator's preferred proposal.  The first initiator token SHOULD
-          NOT contain EncSshKeyUserAuth, because the initiator cannot encrypt
-          user authentication until it has received the acceptor ECDH public
-          key.
+          initiator's preferred proposal.  When pk is present, nonce and
+          acceptorName MUST also be present.  The first initiator token
+          SHOULD NOT contain EncSshKeyUserAuth, because the initiator cannot
+          encrypt user authentication until it has received the acceptor
+          ECDH public key.
         </t>
       </section>
       <section anchor="acceptor-first-token">
@@ -301,6 +484,9 @@ K_base = KDF(
           SshKeyHostAuth, and sctx.  The token contains the acceptor's
           supported algorithms, preferred key-exchange public value, and a
           host-key signature over the acceptor-first challenge transcript.
+          Because the initiator has not yet supplied a target name, the
+          acceptor MUST obtain acceptorName from a named acceptor credential
+          before producing this token.
         </t>
         <t>
           The initiator response to an acceptor-first token contains its own
@@ -355,11 +541,27 @@ K_base = KDF(
         <t>
           The acceptor decrypts encuserauth, validates the SSH user
           signature, authorizes the requested username, verifies the
-          initiator finished MAC, and returns SSH-KEY-COMPLETE.  If the
-          signature algorithm is not acceptable, the acceptor MAY return
-          SSH-KEY-CONTINUE-NEEDED with sctx and a narrower sigtypes list.  If
-          validation, key confirmation, or authorization fails, the acceptor
-          returns SSH-KEY-FAILURE.
+          initiator finished MAC, and verifies that sctx is current.  It then
+          sets the accepted source name to the requested username and returns
+          SSH-KEY-COMPLETE.
+        </t>
+        <t>
+          If the user signature is valid but that key is not authorized for
+          the requested username, the acceptor MAY return
+          SSH-KEY-CONTINUE-NEEDED.  This retry token contains negotiation-form
+          SshKeyKEX with the original acceptor sigtypes, the unchanged sctx,
+          and the retry SshKeyFinished described in
+          <xref target="transcript"/>.  It contains no hostauth, encuserauth,
+          cctx, or key-exchange proposal.  The initiator MUST verify all of
+          these constraints and the retry Finished against its exact previous
+          encuserauth before advancing to its next configured key and
+          signature-algorithm candidate.  Candidate exhaustion fails the
+          context locally.
+        </t>
+        <t>
+          Invalid signatures, unadvertised algorithms, malformed tokens,
+          failed freshness, and failed key confirmation are not retryable and
+          fail context establishment.
         </t>
         <t>
           A peer that receives SSH-KEY-FAILURE MUST fail context
@@ -381,11 +583,25 @@ K_base = KDF(
         Context state MUST be confidentiality and integrity protected using
         keys unavailable to the peer that stores or reflects the state.
         Long-term private keys MUST NOT be stored in cctx or sctx.  Context
-        state SHOULD include the key-exchange transcript values and enough
-        freshness data to prevent replay.
+        state MUST include the key-exchange transcript values and an
+        authenticated issuedAt Unix time.  The acceptor MUST apply a local
+        maximum-age policy to issuedAt and reject missing or malformed values.
+        An acceptor MAY tolerate limited future skew to accommodate clock
+        differences between acceptors sharing a context-protection key.
         For acceptor continuations, sctx MUST contain enough encrypted state
         for another acceptor process with the same context-protection key to
-        finish authentication.
+        finish authentication.  This state MUST include acceptorName so a
+        continuation cannot be moved to a different acceptor audience.
+      </t>
+      <t>
+        The local age limit bounds but does not eliminate replay.  Without a
+        fresh carrier binding or external single-use state, a completed
+        stateless exchange is a bearer token while the acceptor's local age
+        policy accepts issuedAt.  This specification does not require a replay
+        cache because availability and coordination of such state are
+        deployment properties.  A future integration may let a carrier
+        explicitly accept responsibility for replay mitigation, for example
+        when TLS already provides an encrypted channel.
       </t>
       <t>
         In the acceptor-first flow, sctx contains the acceptor's ephemeral
@@ -397,17 +613,18 @@ K_base = KDF(
     <section anchor="per-message">
       <name>Per-Message Tokens</name>
       <t>
-        After SSH-KEY-COMPLETE, gss_get_mic(), gss_verify_mic(),
-        gss_wrap(), and gss_unwrap() use CFX token framing
-        <xref target="RFC4121"/>.  K_c2s protects initiator-to-acceptor
-        tokens.  K_s2c protects acceptor-to-initiator tokens.  Sequence
-        numbers start at zero in each direction.  The token framing is from
-        RFC 4121, but the encryption profile is aes256-gcm-sha256 rather
-        than a Kerberos RFC 3961 encryption type.
+        After SSH-KEY-COMPLETE, gss_get_mic(), gss_verify_mic(), gss_wrap(),
+        and gss_unwrap() use CFX token framing <xref target="RFC4121"/> and the
+        RFC 8009 AES128-CTS-HMAC-SHA256-128 profile.  K_base is the profile
+        protocol key.  RFC 4121 key usages 22 and 23 protect tokens sent by the
+        acceptor; usages 24 and 25 protect tokens sent by the initiator.
+        Sequence numbers start at zero in each direction.
       </t>
       <t>
-        A receiver MUST reject duplicate, reordered, or skipped tokens when
-        the corresponding GSS-API replay or sequence flags were negotiated.
+        A receiver authenticates a token before classifying its sequence
+        number.  Authenticated duplicate, old, reordered, and gap tokens return
+        the corresponding GSS supplementary status while retaining the
+        authenticated output, as required by GSS-API.
       </t>
     </section>
 
@@ -424,10 +641,20 @@ K_base = KDF(
     <section anchor="iana">
       <name>IANA Considerations</name>
       <t>
-        This -00 draft requests no IANA action.  Before publication as an
-        RFC, the private experimental OID in <xref target="identity"/> must
-        be replaced by a permanent GSS-API mechanism OID from an appropriate
-        arc.
+        IANA is requested to assign one new entry from the "SMI Security for
+        Mechanism Codes" registry under
+        iso.org.dod.internet.security.mechanisms (1.3.6.1.5.5):
+      </t>
+      <sourcecode type="text"><![CDATA[
+Value:       TBD1
+Name:        sshkey
+Description: SSH Public-Key GSS-API Mechanism
+Reference:   This document, Section 3
+]]></sourcecode>
+      <t>
+        The assigned value replaces TBD1 in <xref target="identity"/>.  The
+        private implementation OID shown there is not requested for
+        registration.
       </t>
     </section>
 
@@ -455,14 +682,24 @@ K_base = KDF(
         unless host-key policy succeeds.
       </t>
       <t>
-        All encrypted fields require nonce uniqueness.  Reusing a nonce with
-        an AEAD key can reveal plaintext and invalidate authentication.
+        Every AES-CTS encryption requires a fresh, unpredictable 16-octet
+        confounder.  An implementation MUST fail rather than emit an encrypted
+        field or sealed per-message token if its random source fails.
       </t>
       <t>
         Context state tokens are especially sensitive.  They MUST be
-        integrity protected, SHOULD be bound to the key-exchange transcript
-        values, and SHOULD contain replay protection such as an expiration
-        time or single-use state identifier.
+        integrity protected and bound to the key-exchange transcript values,
+        acceptor audience, and issuance time.  Local maximum-age policy limits
+        only the replay window.  A completed token remains reusable while that
+        policy accepts it unless the carrier mitigates replay.  Implementations
+        MUST document this property and MUST NOT describe age checking alone
+        as single-use replay protection.
+      </t>
+      <t>
+        A DNS hostname for the initiator is not authenticated by this
+        mechanism and MUST NOT be used for local authorization, as specified
+        in <xref target="authorization-context"/>.  Reverse DNS does not turn
+        a transport source address into an authenticated initiator identity.
       </t>
       <t>
         This draft intentionally uses a private experimental OID.  Deploying
@@ -475,12 +712,15 @@ K_base = KDF(
       <name>Implementation Status</name>
       <t>
         The repository associated with this draft currently implements the
-        mechanism loader interface, SAnon-compatible X25519 key derivation,
-        SSH signature blob handling, encrypted acceptor continuation state,
-        client-first and acceptor-first context establishment, RFC 4121-style
-        per-message protection, and smoke tests that prove Heimdal can load
-        the mechanism.  The implementation has not yet caught up with this
-        draft's authorized_keys authorization.
+        mechanism loader interface for Heimdal and MIT krb5,
+        SAnon-compatible X25519 key derivation, SSH signature blob handling,
+        encrypted acceptor continuation state, client-first and
+        acceptor-first context establishment, RFC 4121-style per-message
+        protection, and focused OpenSSH configuration and authorized_keys
+        policy.  Repeatable tests cover loader interoperability,
+        authenticated context establishment, and per-message protection.
+        Direct OpenSSH client and server integration remains implementation
+        work.
       </t>
     </section>
 
@@ -528,6 +768,7 @@ SshKeyKEX ::= SEQUENCE {
 	, pk		[4] OCTET STRING	OPTIONAL
 	, enctype	[5] OCTET STRING	OPTIONAL
 	, nonce		[6] OCTET STRING	OPTIONAL
+	, acceptorName	[7] OCTET STRING	OPTIONAL
 }
 
 SshKeyFinished ::= SEQUENCE {
@@ -543,6 +784,8 @@ SshKeyServerContext ::= SEQUENCE {
 	, acceptorSk	[5] OCTET STRING	OPTIONAL
 	, initiatorNonce [6] OCTET STRING	OPTIONAL
 	, acceptorNonce [7] OCTET STRING
+	, acceptorName	[8] OCTET STRING
+	, issuedAt	[9] INTEGER
 }
 
 SshKeyStatus ::= INTEGER {
@@ -659,6 +902,17 @@ END
           <date year="2016" month="January"/>
         </front>
         <seriesInfo name="RFC" value="7748"/>
+      </reference>
+      <reference anchor="RFC8009"
+                 target="https://www.rfc-editor.org/rfc/rfc8009">
+        <front>
+          <title>AES Encryption with HMAC-SHA2 for Kerberos 5</title>
+          <author initials="M." surname="Jenkins"/>
+          <author initials="M." surname="Peck"/>
+          <author initials="K." surname="Burgin"/>
+          <date year="2016" month="October"/>
+        </front>
+        <seriesInfo name="RFC" value="8009"/>
       </reference>
     </references>
   </back>

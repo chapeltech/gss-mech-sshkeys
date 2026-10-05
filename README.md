@@ -1,162 +1,353 @@
 # gss-sshkey
 
-`gss-sshkey` is a GSS-API mechanism for authenticating with SSH keys.  The
-goal is to make SSH identity useful outside SSH without asking users to learn a
-new credential system.
+`gss-sshkey` is a GSS-API mechanism that authenticates users with ordinary SSH
+public keys.  It lets a GSS-enabled service reuse common SSH identity,
+host-trust, and `authorized_keys` policy without implementing or tunnelling
+the SSH protocol.
 
-The intended user experience is:
+The mechanism answers a focused login question:
 
-1. A user already has an SSH key, often loaded in `ssh-agent`.
-2. A server already authorizes that user with normal `authorized_keys` data.
-3. A GSS-enabled application can authenticate with that SSH key.
+> May this authenticated SSH key log in as this local account from this
+> source?
 
-For example, if an IMAP server runs on a host where `alice` has her SSH public
-key in `~alice/.ssh/authorized_keys`, then Alice should be able to use a
-GSS-capable IMAP client such as `mutt` without typing an IMAP password.  The
-mechanism should reuse the SSH deployment that already exists: OpenSSH key
-files, `ssh-agent`, SSH signature formats, SSH host-key trust data, and
-`authorized_keys` authorization.
+It does not implement SSH transport packets, SSH userauth messages, shells,
+commands, forwarding, TTY handling, or post-login session restrictions.
 
-## Status
+## Current Milestone
 
-This repository is currently a Rust conversion and protocol prototype.  It
-builds a standalone shared object, `sshkey.so`, that Heimdal can load as a GSS
-mechanism.  The shared object is intended to remain independent of Heimdal
-internals so it can later be loaded by MIT krb5 as well.
+The `0.1` goal is the common SSH public-key authentication case:
 
-Implemented so far:
+- Ed25519 and ECDSA user keys from `ssh-agent` or an unencrypted
+  `IdentityFile`;
+- RSA-SHA2 user keys through `ssh-agent`;
+- non-interactive host-key verification through a caller-verified host key,
+  `known_hosts`, or DNSSEC-validated SSHFP records;
+- a requested username from typed caller context, resolved `User`, or the
+  invoking local username;
+- plain `authorized_keys` authorization, with unexpired `expiry-time` entries;
+- common client and server `Host`, `Match`, and `Include` configuration; and
+- GSS integrity, confidentiality, replay, and sequencing services after
+  establishment.
 
-- Rust `cdylib` build producing `sshkey.so`.
-- ASN.1 generation from `sshkey.asn1` through `rasn-compiler` and `rasn`.
-- Anonymous X25519 context establishment.
-- A SAnon-X25519-compatible SP800-108 HMAC-SHA256 KDF.
-- SSH signature blob encode, decode, sign, and verify helpers.
-- Acceptor host-key signatures from OpenSSH private keys.
-- Initiator user-key signatures through `ssh-agent`.
-- Client host-key trust through OpenSSH `known_hosts` files and
-  DNSSEC-validated SSHFP records.
-- Finished MAC key confirmation over the ECDH-derived session key.
-- Encrypted stateless acceptor context returned through `sctx`.
-- Client-first and acceptor-first context establishment.
-- Reusable `rfc4121` crate for wrap and MIC token framing, sequence handling,
-  split-token size planning, Kerberos AES-CTS/HMAC-SHA1 and
-  AES-CTS/HMAC-SHA2 profiles.
-- Initial `gss-mech-builder` crate for GSS ABI definitions, RFC4121
-  per-message scaffolding, and signed-ECDH handshake scaffolding.
-- RFC 4121-style per-message wrapping with `gss_wrap`,
-  `gss_unwrap`, `gss_wrap_iov`, and `gss_unwrap_iov`.
-- RFC 4121-style MICs with `gss_get_mic` and `gss_verify_mic`.
-- Smoke tests using `/usr/local/bin/gss-token`.
+The exact requirements and non-goals are in `REQUIREMENTS.md`.  In particular,
+the mechanism does not prompt.  Missing identity material, an unverified host
+key, or unresolved security-critical configuration makes authentication fail.
+The mechanism stands on its own through the standard GSS-API; native OpenSSH
+integration is optional and does not gate a release.
 
-Not complete yet:
+The current release is `0.1.0-alpha.1`, distributed as source plus separate
+Heimdal and MIT krb5 binary archives.  It is not published on crates.io.  See
+`RELEASE-NOTES.md` for the alpha's security limitations.
 
-- `authorized_keys` lookup and authorization.
-- Moving the current signed-ECDH handshake onto the new builder layer.
-- Production OID assignment and packaged installation.
+## Repository Layout
 
-Without a configured user key, the mechanism still completes anonymously and
-has the same man-in-the-middle limitation as an anonymous ECDH mechanism.
+- `src/lib.rs` implements the mechanism-specific ASN.1 exchange and focused
+  SSH credential and authorization adapters.
+- `src/host_trust.rs` combines caller-verified keys, `known_hosts`, and SSHFP
+  host trust.
+- `src/sshfp.rs` performs DNSSEC validation and SSHFP fingerprint matching
+  through Hickory.
+- `sshkey.asn1` is the message schema and concise protocol description.
+- `draft-dowdeswell-kitten-gss-sshkey-00.xml` is the protocol specification.
+- `include/gss_sshkey.h` defines the optional typed integration boundary.
+- `../ssh-config` parses and resolves client and server configuration and
+  parses `authorized_keys` entries.
+- `../gss-mech-builder` owns generic GSS ABI and loader integration.
+- `../rfc4121` provides message protection only through
+  `gss-mech-builder`.
+
+`ARCHITECTURE.md` records these ownership boundaries.  `TODO.md` contains only
+release-blocking work; deferred compatibility work is in `BACKLOG.md`.
 
 ## Build
 
-Install Rust through `rustup`, then build from the repository root:
+An existing Rust toolchain with Cargo is required.  The adjacent
+`ssh-config`, `gss-mech-builder`, and `rfc4121` repositories must be present at
+the paths shown above.
+
+Build the shared object:
 
 ```sh
 make
 ```
 
-The build uses Cargo and writes its Rust toolchain state under the repository
-by default:
-
-```make
-RUSTUP_HOME ?= $(CURDIR)/.rustup
-CARGO_HOME ?= $(CURDIR)/.cargo
-```
-
-The output file is:
-
-```text
-sshkey.so
-```
+The result is `sshkey.so`.  Cargo generates Rust bindings from `sshkey.asn1`
+in its build directory; generated ASN.1 files are not committed.
 
 ## Test
 
-Run the Rust unit tests and the GSS smoke tests:
+Run the focused Rust, header, install, package, and GSS smoke tests:
 
 ```sh
 make test
 ```
 
-The GSS test runner creates a private `/etc/gss/mech` mount namespace and uses
-`/usr/local/bin/gss-token` and `/usr/local/bin/knc` by default.  Override paths
-or the local `knc` port with environment variables when needed:
+The Rust tests run Cargo in offline mode and also test the adjacent
+`rfc4121`, `gss-mech-builder`, and `ssh-config` crates.  The GSS smoke runner
+creates temporary Ed25519 identity, host-key, `known_hosts`, and
+`authorized_keys` fixtures.  It covers a real `ssh-agent`, client
+configuration selection, authentication rejection, source policy, channel
+bindings, local-name authorization, MIC, and wrap.  Optional Heimdal, MIT
+krb5, `gss-token`, and `knc` phases report a skip when their local
+prerequisites are unavailable.
+
+Mechanism-level Rust conformance tests use the black-box harness from
+`gss-mech-builder`. The `gss-sshkey` fixture supplies keys, configuration,
+credentials, exchange flags, and acceptor-result validation only. The harness
+owns the conventional public GSS bindings and generic establishment,
+authorization, message-protection, extension, and failure tests. RFC 4121
+token and cryptographic behavior is tested in `rfc4121`; builder ABI adaptation
+is tested in `gss-mech-builder`.
+
+Before publishing an alpha, run the strict acceptance target:
 
 ```sh
-GSS_TOKEN=/path/to/gss-token make test
-KNC=/path/to/knc make test
-KNC_PORT=45679 make test
-GSSAPI_LIB=/path/to/libgssapi.so make test
+make test-alpha
 ```
+
+This requires the real-agent, Heimdal loader, and MIT loader phases.  A
+missing prerequisite or unavailable loader namespace is an error, not a
+skip.
+
+Run individual groups with:
+
+```sh
+make test-rust
+make test-context-helper
+make test-gss-token
+make test-install
+make test-package
+make test-source-package
+```
+
+The opt-in OpenSSH test performs a real `gssapi-with-mic` login with native
+public-key authentication disabled.  It requires an OpenSSH server built with
+the focused integration patch documented in `tests/openssh-live/README.md`:
+
+```sh
+make test-openssh-live SSHD_BIN=/path/to/integrated/sshd
+```
+
+This is optional application-integration evidence, not part of the release
+acceptance suite.
+
+## Install
+
+The default install uses Heimdal's four-field mechanism configuration:
+
+```sh
+sudo make install
+```
+
+For MIT krb5:
+
+```sh
+sudo make install GSS_MECH_CONFIG_FORMAT=mit
+```
+
+Important path variables are `PREFIX`, `LIBDIR`, `INCLUDEDIR`, `SYSCONFDIR`,
+`GSS_MECH_DIR`, and `GSS_MECH_LIBDIR`.  `DESTDIR` supports staged packaging.
+
+The current OID, `1.3.6.1.4.1.99999.1`, is private and experimental.  It must
+be replaced by an assigned mechanism OID before interoperable deployment.
+
+## Package
+
+Build and test all release archives with:
+
+```sh
+make release-alpha
+```
+
+This reruns `make test-alpha` and writes three versioned archives under
+`dist/`:
+
+- `gss-sshkey-0.1.0-alpha.1-source.tar.gz` contains `gss-sshkey` and the
+  exact sibling `gss-mech-builder`, `rfc4121`, and `ssh-config` sources needed
+  by its path dependencies;
+- `gss-sshkey-0.1.0-alpha.1-heimdal.tar.gz` contains an installed shared
+  object, public header, Heimdal mechanism configuration, licence, and release
+  notes; and
+- `gss-sshkey-0.1.0-alpha.1-mit.tar.gz` contains the corresponding MIT krb5
+  mechanism configuration.
+
+The source archive has a top-level `SOURCE-MANIFEST.txt`.  Package tests
+recompute that manifest, reject VCS/build/cache material, resolve all path
+dependencies from the extracted tree, and compare the complete binary archive
+file list.
+
+## Use
+
+A GSS initiator imports a host-based service name such as
+`imap@mail.example.com` and requests the GSS-SSHKEY mechanism OID.  The host
+component selects client configuration and host-key policy.  The acceptor
+loads a host private key, verifies the user proof, and authorizes the key for
+the requested local account.  A completed context reports that requested
+username as its authenticated GSS source name.
+
+Direct RSA private-key signing is disabled because the current Rust RSA
+backend is not suitable for this use.  RSA-SHA2 user keys remain available
+through `ssh-agent`, and RSA public signatures remain verifiable.  Acceptor
+host keys and direct `IdentityFile` signing must use Ed25519 or ECDSA.
+
+An embedding client or server can stage facts already established by its
+transport through `include/gss_sshkey.h`:
+
+- client `user`: the requested remote account;
+- client `host-key`: the verified raw SSH public-key blob; and
+- server `peer-address`: the numeric source address used by authorization
+  policy.
+
+Fields are one-shot and thread-local.  The next applicable context creation
+consumes them.  Supplying a verified host key avoids rereading `known_hosts`,
+but only an exact key match is accepted.
+
+The acceptor never uses a DNS client hostname for authorization.  It does not
+perform reverse DNS, accept a client-asserted hostname, or reinterpret a
+numeric peer address as a hostname.  Hostname-dependent server policy fails
+closed.  Address-dependent policy is evaluated only when the embedding
+transport supplies its locally observed numeric `peer-address`; otherwise it
+also fails closed when it could affect authorization.
+
+Example client setup:
+
+```c
+gss_sshkey_context_field fields[] = {
+    gss_sshkey_context_string(GSS_SSHKEY_FIELD_USER, "alice"),
+    gss_sshkey_context_bytes(GSS_SSHKEY_FIELD_HOST_KEY,
+        host_key_blob, host_key_blob_len),
+};
+
+major = gss_sshkey_set_client_context(&minor, fields,
+    GSS_SSHKEY_ARRAY_LEN(fields));
+```
+
+The remote username is not supplied through `gss_acquire_cred()`.  Credential
+acquisition identifies the SSH credential principal; it does not select an
+account on a remote host.  Version `0.1` supports default credential
+acquisition for initiators and returns `GSS_S_UNAVAILABLE` for a non-null
+initiator desired name.  Named acceptor credentials remain supported.
+The mechanism binds the canonical host-based acceptor name into host and user
+signatures and key confirmation.  Acceptor-first establishment therefore
+requires a named acceptor credential; ordinary initiator-first SSH operation
+may use the default acceptor credential because the initiator supplies the
+name before the host signature is made.
 
 ## Configuration
 
-For local testing, the mechanism stanza is in
-`tests/gss-token/gss-mech.conf`:
+By default, the initiator reads `~/.ssh/config` and
+`/etc/ssh/ssh_config`.  It resolves the destination and relevant authentication
+settings through the adjacent `ssh-config` crate.  Supported common settings
+include:
 
 ```text
-sshkey 1.3.6.1.4.1.99999.1 ../../sshkey.so -
+Host
+Match
+Include
+HostName
+User
+Port
+IdentityAgent
+IdentityFile
+IdentitiesOnly
+PubkeyAcceptedAlgorithms
+HostKeyAlias
+UserKnownHostsFile
+GlobalKnownHostsFile
+VerifyHostKeyDNS
+GSSAPIAuthentication
+PreferredAuthentications
 ```
 
-The OID is a placeholder.  A real deployment needs an assigned OID and an
-installation path appropriate for the host GSS implementation.
+`VerifyHostKeyDNS yes` permits a DNSSEC-validated matching SSHFP record to
+authenticate a host that is not present in `known_hosts`.  Insecure,
+indeterminate, bogus, missing, or mismatching DNS data never establishes
+trust.  `ask` cannot authorize a key because the mechanism has no interactive
+prompt channel.  `HostKeyAlias` selects the `known_hosts` lookup name; SSHFP
+uses the resolved `HostName`.
 
-Prototype signing configuration is environment-variable based.  The initiator
-uses `SSH_AUTH_SOCK` and asks `ssh-agent` to sign, because a GSS mechanism
-generally cannot interactively ask the user for SSH key passphrases.
+User keys are attempted in OpenSSH order: configured identities available
+through the agent, other agent identities unless `IdentitiesOnly` is set, and
+then remaining configured private-key files.  Signature algorithms for each
+key follow `PubkeyAcceptedAlgorithms`.  If a valid signature is not authorized,
+the acceptor returns a session-authenticated retry and the initiator advances
+to the next key or algorithm.  It never advances on an unauthenticated retry.
 
-- `SSHKEY_HOST_KEY`: OpenSSH private key used by the acceptor to sign its ECDH
-  reply.
-- `SSHKEY_KNOWN_HOSTS`: optional colon-separated list of known-hosts files for
-  initiator host-key trust.  Defaults to the user's OpenSSH files and
-  `/etc/ssh/ssh_known_hosts`.
-- `SSHKEY_HOST`: optional host-name override for tests.  Normal operation uses
-  the host component of the GSS target name.
-- `SSHKEY_USER`: authorization name signed by the initiator.  Defaults to
-  `USER`, then `sshkey`.
-- `SSHKEY_CTX_KEY`: 32-byte hex key used to encrypt acceptor continuation
-  state for stateless or load-balanced servers.
+The acceptor reads `/etc/ssh/sshd_config` and uses common login policy from:
 
-If `SSHKEY_CTX_KEY` is not set, the process creates a random local key.  That
-works for one acceptor process but cannot support a different server process
-finishing the authentication.
+```text
+Match User
+Match Address
+Match Group
+AuthorizedKeysFile
+AllowUsers
+DenyUsers
+AllowGroups
+DenyGroups
+PermitRootLogin
+RevokedKeys
+PubkeyAcceptedAlgorithms
+RequiredRSASize
+StrictModes
+GSSAPIAuthentication
+```
+
+Valid unrelated directives do not invalidate either configuration.  A
+malformed supported directive or an unsupported condition that could change
+the selected host, user, identity, trust, or authorization result fails the
+affected authentication attempt.
+
+The acceptor supports plain `authorized_keys` entries and entries containing
+only an unexpired `expiry-time`.  Any other key option makes that entry
+unavailable to this mechanism.  In particular, `from=` address restrictions,
+certificate-authority entries, forced commands, and SSH session restrictions
+are not silently discarded.
+
+The following environment variables remain compatibility and test adapters:
+
+- `SSHKEY_SSH_CONFIG`: colon-separated client configuration paths;
+- `SSHKEY_SSHD_CONFIG`: server configuration path;
+- `SSHKEY_HOST_KEY`: acceptor OpenSSH private-key path;
+- `SSHKEY_AUTHORIZED_KEYS`: colon-separated authorization file paths;
+- `SSHKEY_KNOWN_HOSTS`: colon-separated host-trust file paths;
+- `SSHKEY_USER`: requested username when typed context is unavailable;
+- `SSHKEY_HOST`: target-host override;
+- `SSHKEY_CTX_KEY`: 32-byte hexadecimal continuation-state key.
+
+Normal embedding should prefer typed context for facts already known by the
+caller.  Environment variables are process-wide and therefore unsuitable for
+mixing independent transport contexts in one process.  A server peer address
+is connection-specific and is accepted only through typed context.
+
+If `SSHKEY_CTX_KEY` is absent, the process generates a local random key.  A
+shared key is required when different acceptor processes may begin and finish
+the same exchange.  Invalid configured key material or unavailable operating
+system randomness fails closed.
+
+Sealed acceptor continuation state carries an authenticated issuance time and
+is bound to its canonical acceptor name.  The server applies its local age
+policy; version `0.1` accepts it for less than 120 seconds.  Without carrier
+replay mitigation, a captured completed exchange remains a bearer token during
+that window.  This is an explicit limitation: the mechanism does not require a
+replay cache or channel bindings that many reverse-proxied deployments cannot
+provide.  OpenSSH additionally binds GSS authentication to its fresh transport
+session through `gssapi-with-mic`.
 
 ## Protocol
 
-The protocol is documented in `sshkey.asn1` and in
-`draft-dowdeswell-kitten-gss-sshkey-00.xml`.
+The ASN.1 exchange performs ephemeral key agreement, proves possession of the
+acceptor host key and initiator user key, encrypts the username and user proof,
+confirms the derived key, and establishes RFC 4121-style message protection.
+When supplied, the complete GSS channel-binding structure is included in key
+derivation and every authentication transcript.
 
-The anonymous ECDH base intentionally follows Heimdal SAnon-X25519's key
-derivation so the Rust implementation can be tested against known behavior
-while remaining standalone.  The intended signed flow has two conceptual
-pieces:
+SSH public-key and signature encodings are reused as credential formats.  The
+signed data is the GSS-SSHKEY transcript defined by `sshkey.asn1`, not an
+`SSH_MSG_USERAUTH_REQUEST`.
 
-- peers sign their ECDH contribution and associated algorithm, name, and
-  channel-binding context with SSH keys;
-- after ECDH, peers demonstrate knowledge of the derived session key with a
-  Finished MAC.
+Protocol-visible changes must update both `sshkey.asn1` and the
+Internet-Draft.
 
-User authentication remains an encrypted ASN.1 payload.  It may appear in any
-token sent after the sender has enough ECDH material to derive the session key.
-In initiator-first protocols this keeps the username and user public key out of
-the first cleartext token without adding a round trip.
+## License
 
-The mechanism also supports acceptor-first operation.  If a protocol calls
-`gss_accept_sec_context()` before any initiator token exists, the acceptor sends
-a signed ECDH challenge and encrypted `sctx`; the initiator returns its ECDH
-public key, encrypted userauth, key confirmation, and the same `sctx`.
-HTTP Negotiate can use this mode naturally: the server can include an
-acceptor-first token in a `401 WWW-Authenticate` header, and the client can
-return its response token in the `Authorization` header.
-
-The next policy step is checking the user key against the target user's
-`authorized_keys`.
+`gss-sshkey` is distributed under the BSD 2-Clause License.  See `COPYING`.

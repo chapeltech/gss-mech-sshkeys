@@ -6,7 +6,9 @@ BEGIN
 -- keys.  The corresponding Internet-Draft source is
 -- draft-dowdeswell-kitten-gss-sshkey-00.xml.
 --
--- All context-establishment tokens are DER encodings of SshKeyToken.
+-- Every SshKeyToken value is DER encoded.  The first token emitted by an
+-- initiator that begins an exchange is additionally wrapped as the RFC 2743
+-- InitialContextToken for this mechanism OID.  All other tokens are raw DER.
 --
 
 SshKeyCtx ::= SEQUENCE {
@@ -24,7 +26,15 @@ EncCtx ::= SEQUENCE {
 -- username contains the requested authorization identity.  sig proves
 -- possession of the corresponding SSH user private key.  keytype is the SSH
 -- public key algorithm name, key is the raw SSH public key blob, sigtype is
--- the SSH signature algorithm name, and sig is the SSH signature blob.
+-- the SSH signature algorithm name, and sig is the SSH signature blob.  When
+-- this mechanism is used for regular SSH login, username is the requested
+-- local account selected by SSH userauth policy.
+--
+-- On successful authorization, the accepted GSS source name is the exact
+-- requested username.  Its display form is username, and its exported name is
+-- the RFC 2743 exported-name token for this mechanism OID with username as the
+-- mechanism name payload.  The SSH key proves authorization for that account;
+-- its fingerprint is not the GSS source name.
 --
 -- User authentication is not a distinct cleartext first-message step.
 -- EncSshKeyUserAuth may appear in any token sent after the sender knows the
@@ -64,31 +74,43 @@ SshKeyHostAuth ::= SEQUENCE {
 -- separate because RSA public keys may be used with ssh-rsa, rsa-sha2-256, or
 -- rsa-sha2-512 signatures.
 --
--- The initiator should optimistically sign the first encrypted userauth it can
--- produce after it has enough ECDH material to derive the session key.  If
--- the acceptor cannot accept that signature algorithm, it returns
--- CONTINUE-NEEDED with an encrypted server context and a narrower sigtypes
--- list.
+-- The initiator tries configured key and signature-algorithm candidates in
+-- OpenSSH order after it can derive the session key.  If a valid signature is
+-- not authorized, the acceptor may return CONTINUE-NEEDED with the unchanged
+-- encrypted server context, the original sigtypes list, and an authenticated
+-- retry Finished.  The initiator verifies that proof before trying the next
+-- candidate.  Invalid signatures and malformed exchanges are not retryable.
 --
 -- GSS does not require the initiator to produce the first token.  When
 -- gss_accept_sec_context() is called with no input token, the acceptor sends
 -- the same kind of KEX token as a signed challenge.  The initiator then
 -- returns its KEX public key, the reflected encrypted server context, and
--- encrypted userauth when available.
+-- required encrypted userauth.  Context establishment fails if the initiator
+-- cannot produce userauth or if the acceptor receives a final token without
+-- it; this mechanism does not provide anonymous access.
 --
 -- HTTP Negotiate is a natural acceptor-first carrier: a server can include an
 -- acceptor-first GSS-SSHKEY token in a 401 WWW-Authenticate header, and the
 -- client can return its KEX public key, encrypted userauth, key confirmation,
 -- and reflected sctx in the Authorization header.
 --
--- The anonymous ECDH profile derives its base session key using the same
+-- The ECDH profile derives its base session key using the same
 -- SP800-108 HMAC-SHA256 counter-mode KDF inputs as Heimdal SAnon-X25519:
 --
 --	K1	= raw X25519 shared secret
 --	label	= "sanon-x25519"
 --	context	= initiator-pk || acceptor-pk || uint32(0) ||
---		  uint32(flags) || channel-binding application-data
+--		  uint32(flags) || canonical-channel-bindings
 --	L	= 128 bits
+--
+-- canonical-channel-bindings is 0x00 when the caller supplies no bindings.
+-- A present GSS channel-binding structure is encoded as 0x01 followed by the
+-- initiator address type, initiator address length and bytes, acceptor address
+-- type, acceptor address length and bytes, and application-data length and
+-- bytes.  Every integer and length is an unsigned 32-bit little-endian value,
+-- following the RFC 4121 channel-binding hash input.  Zero lengths remain in
+-- the encoding, so a present empty structure is distinct from no bindings.
+-- Every call for one context must supply the same canonical value.
 --
 -- SSHKEY currently sends no SAnon-style optional protocol flags, so flags is
 -- zero.  The derived base session key is used for any further tokens including
@@ -98,6 +120,13 @@ SshKeyHostAuth ::= SEQUENCE {
 -- new mechanism and does not support Kerberos DES, Triple-DES, RC4, or other
 -- legacy RFC 4121 encryption types.  The current enctype profile is
 -- aes128-cts-hmac-sha256-128.
+--
+-- EncSshKeyUserAuth and sctx encPart contain ciphertext followed directly by
+-- a 16-octet checksum.  They do not contain an enctype name or explicit nonce.
+-- The encryption profile is RFC 8009 AES128-CTS-HMAC-SHA256-128 with key usage
+-- 24, a random 16-octet confounder, and a field label prepended to the RFC 8009
+-- integrity input as associated data.  The labels are "SSHKEY userauth v1" and
+-- "SSHKEY server context v1", respectively.
 
 SshKeyKEX ::= SEQUENCE {
 	-- Negotiation part
@@ -110,14 +139,19 @@ SshKeyKEX ::= SEQUENCE {
 	, pk		[4] OCTET STRING	OPTIONAL
 	, enctype	[5] OCTET STRING	OPTIONAL
 	, nonce		[6] OCTET STRING	OPTIONAL
+	-- Canonical host-based GSS target name.  Required whenever pk is present;
+	-- omitted only from negotiation-only retry tokens.
+	, acceptorName	[7] OCTET STRING	OPTIONAL
 }
 
 --
 -- SshKeyFinished proves knowledge of the session key derived from the ECDH
 -- exchange and transcript.  mac is computed with a key-confirmation key
 -- derived from the exchange session key and covers the transcript hash, role,
--- and peer nonce.  It is not an SSH signature and does not require another
--- ssh-agent operation.
+-- and peer nonce.  An acceptor userauth-retry Finished instead covers the
+-- original handshake hash, exact rejected encuserauth, unchanged sctx, retry
+-- role, and initiator nonce.  It is not an SSH signature and does not require
+-- another ssh-agent operation.
 
 SshKeyFinished ::= SEQUENCE {
 	  mac		[0] OCTET STRING
@@ -128,7 +162,10 @@ SshKeyFinished ::= SEQUENCE {
 -- The client must return sctx unchanged with any continuation token so another
 -- acceptor process with the same context-protection key can finish the
 -- authentication.  The nonces are retained here so a stateless acceptor can
--- verify SshKeyFinished when the initiator returns.
+-- verify SshKeyFinished when the initiator returns.  issuedAt is a Unix time
+-- in seconds.  The acceptor applies its local maximum-age policy to issuedAt.
+-- This bounds the period in which reflected state can be accepted but does not
+-- make it single-use.
 
 SshKeyServerContext ::= SEQUENCE {
 	  initiatorPk	[0] OCTET STRING	OPTIONAL
@@ -139,6 +176,9 @@ SshKeyServerContext ::= SEQUENCE {
 	, acceptorSk	[5] OCTET STRING	OPTIONAL
 	, initiatorNonce [6] OCTET STRING	OPTIONAL
 	, acceptorNonce [7] OCTET STRING
+	-- The canonical acceptor audience authenticated by this exchange.
+	, acceptorName	[8] OCTET STRING
+	, issuedAt	[9] INTEGER
 }
 
 --
@@ -154,11 +194,20 @@ SshKeyToken ::= SEQUENCE {
 	  status	[0] SshKeyStatus
 	, kex		[1] SshKeyKEX		OPTIONAL
 	, hostauth	[2] SshKeyHostAuth	OPTIONAL
+	-- Required in an initiator's final COMPLETE token.  It remains optional
+	-- in the shared envelope because earlier and acceptor tokens omit it.
 	, encuserauth	[3] EncSshKeyUserAuth	OPTIONAL
 	, cctx		[4] EncCtx		OPTIONAL
 	, sctx		[5] EncCtx		OPTIONAL
 	, finished	[6] SshKeyFinished	OPTIONAL
 }
+
+-- When a valid user signature is not authorized, an acceptor MAY return a
+-- CONTINUE-NEEDED token containing only negotiation-form kex, the unchanged
+-- sctx, and an acceptor userauth-retry Finished.  The initiator MUST verify
+-- that proof against the exact attempt it just sent before trying the next
+-- key and signature-algorithm candidate.  Invalid signatures and malformed
+-- exchanges are not retryable.
 
 --
 -- XXXrcd: how about?

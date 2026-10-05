@@ -2,7 +2,9 @@
 core
 core.*
 /target/
+/dist/
 /.cargo/
+/.codex
 /.rustup/
 
 /asn1-template.h

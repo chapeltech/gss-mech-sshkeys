@@ -1,0 +1,145 @@
+diff --git a/gss-serv.c b/gss-serv.c
+index f9ae303..c86f899 100644
+--- a/gss-serv.c
++++ b/gss-serv.c
+@@ -49,11 +49,16 @@
+ 
+ #include "ssh-gss.h"
+ 
++#ifdef HAVE_GSSAPI_GSSAPI_H
++#include <gssapi/gssapi_ext.h>
++#endif
++
+ extern ServerOptions options;
+ 
+ static ssh_gssapi_client gssapi_client =
+     { GSS_C_EMPTY_BUFFER, GSS_C_EMPTY_BUFFER,
+-    GSS_C_NO_CREDENTIAL, NULL, {NULL, NULL, NULL, NULL}};
++    GSS_C_NO_CREDENTIAL, GSS_C_NO_NAME, NULL,
++    {NULL, NULL, NULL, NULL}};
+ 
+ ssh_gssapi_mech gssapi_null_mech =
+     { NULL, NULL, {0, NULL}, NULL, NULL, NULL, NULL};
+@@ -62,7 +67,25 @@ ssh_gssapi_mech gssapi_null_mech =
+ extern ssh_gssapi_mech gssapi_kerberos_mech;
+ #endif
+ 
++static int
++ssh_gssapi_sshkey_userok(ssh_gssapi_client *client, char *name)
++{
++	return client->source_name != GSS_C_NO_NAME &&
++	    gss_userok(client->source_name, name);
++}
++
++static ssh_gssapi_mech gssapi_sshkey_mech = {
++	"sshkey",
++	"SSH public key",
++	{9, "\x2B\x06\x01\x04\x01\x86\x8D\x1F\x01"},
++	NULL,
++	&ssh_gssapi_sshkey_userok,
++	NULL,
++	NULL
++};
++
+ ssh_gssapi_mech* supported_mechs[]= {
++	&gssapi_sshkey_mech,
+ #ifdef KRB5
+ 	&gssapi_kerberos_mech,
+ #endif
+@@ -314,6 +337,8 @@ ssh_gssapi_getclient(Gssctxt *ctx, ssh_gssapi_client *client)
+ 	/* We can't copy this structure, so we just move the pointer to it */
+ 	client->creds = ctx->client_creds;
+ 	ctx->client_creds = GSS_C_NO_CREDENTIAL;
++	client->source_name = ctx->client;
++	ctx->client = GSS_C_NO_NAME;
+ 	return (ctx->major);
+ }
+ 
+@@ -380,6 +405,7 @@ ssh_gssapi_userok(char *user)
+ 			gss_release_buffer(&lmin, &gssapi_client.displayname);
+ 			gss_release_buffer(&lmin, &gssapi_client.exportedname);
+ 			gss_release_cred(&lmin, &gssapi_client.creds);
++			gss_release_name(&lmin, &gssapi_client.source_name);
+ 			explicit_bzero(&gssapi_client,
+ 			    sizeof(ssh_gssapi_client));
+ 			return 0;
+diff --git a/ssh-gss.h b/ssh-gss.h
+index 7b14e74..ef9799d 100644
+--- a/ssh-gss.h
++++ b/ssh-gss.h
+@@ -72,6 +72,7 @@ typedef struct {
+ 	gss_buffer_desc displayname;
+ 	gss_buffer_desc exportedname;
+ 	gss_cred_id_t creds;
++	gss_name_t source_name;
+ 	struct ssh_gssapi_mech_struct *mech;
+ 	ssh_gssapi_ccache store;
+ } ssh_gssapi_client;
+diff --git a/monitor.c b/monitor.c
+index 4ef73af..3f7309a 100644
+--- a/monitor.c
++++ b/monitor.c
+@@ -76,4 +76,6 @@
+ #include "monitor.h"
+ #ifdef GSSAPI
++#include <dlfcn.h>
++#include <gss_sshkey.h>
+ #include "ssh-gss.h"
+ #endif
+@@ -2000,6 +2002,44 @@ mm_answer_gss_setup_ctx(struct ssh *ssh, int sock, struct sshbuf *m)
+ 	return (0);
+ }
+ 
++typedef OM_uint32 (*gss_sshkey_set_context_fields_fn)(OM_uint32 *,
++    OM_uint32, OM_uint32, const gss_sshkey_context_field *, size_t);
++
++static const u_char gss_sshkey_oid[] = {
++	0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x01
++};
++
++static int
++ssh_gssapi_stage_peer_address(struct ssh *ssh, Gssctxt *ctx)
++{
++	gss_sshkey_set_context_fields_fn set_context_fields;
++	gss_sshkey_context_field field;
++	const char *address = ssh_remote_ipaddr(ssh);
++	OM_uint32 major, minor;
++
++	if (ctx == NULL || ctx->oid == GSS_C_NO_OID ||
++	    ctx->oid->length != sizeof(gss_sshkey_oid) ||
++	    memcmp(ctx->oid->elements, gss_sshkey_oid,
++	    sizeof(gss_sshkey_oid)) != 0)
++		return 0;
++	set_context_fields = (gss_sshkey_set_context_fields_fn)dlsym(
++	    RTLD_DEFAULT, "gss_sshkey_set_context_fields");
++	if (set_context_fields == NULL) {
++		error_f("cannot resolve SSHKEY typed context integration");
++		return -1;
++	}
++	field = gss_sshkey_context_string(GSS_SSHKEY_FIELD_PEER_ADDRESS,
++	    address);
++	major = set_context_fields(&minor, GSS_SSHKEY_CONTEXT_SERVER,
++	    GSS_SSHKEY_CONTEXT_VERSION_1, &field, 1);
++	if (GSS_ERROR(major)) {
++		error_f("cannot stage SSHKEY peer address %s: %u/%u",
++		    address, major, minor);
++		return -1;
++	}
++	return 0;
++}
++
+ int
+ mm_answer_gss_accept_ctx(struct ssh *ssh, int sock, struct sshbuf *m)
+ {
+@@ -2013,7 +2053,10 @@ mm_answer_gss_accept_ctx(struct ssh *ssh, int sock, struct sshbuf *m)
+ 
+ 	if ((r = ssh_gssapi_get_buffer_desc(m, &in)) != 0)
+ 		fatal_fr(r, "ssh_gssapi_get_buffer_desc");
+-	major = ssh_gssapi_accept_ctx(gsscontext, &in, &out, &flags);
++	if (ssh_gssapi_stage_peer_address(ssh, gsscontext) != 0)
++		major = GSS_S_FAILURE;
++	else
++		major = ssh_gssapi_accept_ctx(gsscontext, &in, &out, &flags);
+ 	free(in.value);
+ 
+ 	sshbuf_reset(m);

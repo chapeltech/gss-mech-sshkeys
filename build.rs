@@ -9,6 +9,12 @@ fn main() {
     let asn_path = PathBuf::from("sshkey.asn1");
     let out_path = out_dir.join("sshkey_asn1.rs");
 
+    // A GSS plugin exports generic gss_* names while also referencing them
+    // from its MIT dispatch table.  Keep those references inside the plugin.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-Bsymbolic-functions");
+    }
+
     println!("cargo:rerun-if-changed={}", asn_path.display());
 
     match Compiler::<RasnBackend, _>::new()

@@ -1,39 +1,48 @@
-# GSS loader smoke test
+# GSS smoke tests
 
-This directory provides a local GSS mechanism config and a runner for
-testing that Heimdal can load `sshkey.so` without changing the real
-`/etc/gss/mech`.
+`run.sh` exercises `sshkey.so` through installed GSS-API libraries without
+changing the host's permanent mechanism registry.
 
-The runner uses an unprivileged user and mount namespace to bind a temporary
-`/etc/gss` directory over the system one for the duration of the test. The
-smoke binary then calls `gss_init_sec_context()` with the `sshkey` OID,
-passes the resulting token to `gss_accept_sec_context()`, and completes the
-initiator side with the acceptor token.
+The runner creates a temporary Ed25519 key with `ssh-keygen` and uses it as:
 
-The runner also drives `/usr/local/bin/gss-token` through the same
-initiator/acceptor token exchange.  This uses `LD_PRELOAD` for that binary
-because this Heimdal build's `gss-token -m` path cannot map dynamically
-configured mechanism names with `gss_name_to_oid()`.
+- the initiator's unencrypted `IdentityFile`;
+- the acceptor's host key;
+- the entry in a temporary `known_hosts` file; and
+- the entry in a temporary `authorized_keys` file.
 
-The runner also starts `/usr/local/bin/knc` as a local listener running
-`/bin/cat`, connects with a `knc` client, and checks that one line is echoed
-through the GSS-protected stream.  That covers `gss_wrap()` and
-`gss_unwrap()` through an external program.
+This gives every context exchange real host authentication and user-key
+authorization.  It does not use anonymous fallback or an SSH transport.
 
-## Quick start
-1. Install a Rust toolchain with `cargo`.
-2. Build the library: `make`
-3. Run: `make test-gss-token`
+Separate keys exercise a real `ssh-agent`, rejected host trust, rejected user
+authorization, and numeric source-address policy.  A client fixture resolves
+an alias through `Host` and obtains its identity from `Match final`.  The C
+driver checks peer channel-binding mismatch, `gss_userok()`, MIC, sealed and
+signed wrap, and IOV wrap through the public GSS ABI.  Deterministic DNSSEC
+SSHFP proof classification is covered by the Rust suite.
 
-## Notes
-- `gss-mech.conf` uses the Heimdal `/etc/gss/mech` format. The runner
-  rewrites the `../../sshkey.so` path to an absolute path in its temporary
-  config.
-- `gss-token -m ?` is not used here because this Heimdal build's
-  `gss_oid_to_name()` returns `NULL` for dynamically configured mechanism
-  OIDs, and `gss-token` does not handle that.
-- Override the `gss-token` path with `GSS_TOKEN=/path/to/gss-token`.
-- Override the `knc` path with `KNC=/path/to/knc`.
-- Override the local `knc` listener port with `KNC_PORT=45679`.
-- For repeated loader testing, set `COUNT` (default is 1), e.g.:
-  `COUNT=25 ./run.sh`
+Available phases are:
+
+- an external `knc` authenticated wrap/unwrap exchange which verifies the
+  exported source name against the requested username;
+- a Heimdal loader exchange using a private `/etc/gss` mount namespace;
+- a direct `LD_PRELOAD` exchange, including acceptor-first establishment;
+- an MIT krb5 loader exchange;
+- an external `gss-token` exchange.
+
+Missing optional local tools are reported as skips.  The direct exchange runs
+whenever a C compiler, Heimdal headers and library, and `ssh-keygen` are
+available.  The runner finds `gss-token` on `PATH` or in a sibling Heimdal
+build at `../heimdal/lib/gssapi/gss-token`.
+
+Set `REQUIRE_GSS_LOADERS=1` to make a missing or unrunnable Heimdal or MIT
+loader phase fatal.  Set `REQUIRE_SSH_AGENT=1` to require the real-agent
+phase.  `make test-alpha` enables both settings.
+
+Run the suite after building:
+
+```sh
+make test-gss-token
+```
+
+Useful overrides include `CC`, `GSSAPI_INCLUDE_DIR`, `GSSAPI_LIB`,
+`MIT_GSSAPI_PKG_CONFIG`, `GSS_TOKEN`, `KNC`, `KNC_PORT`, `HOST`, and `COUNT`.
