@@ -38,6 +38,26 @@ and normally requires strong community consensus.  The supporting material is
 the Internet-Draft, the implementation, and the repeatable interoperability
 tests in this repository.
 
+## Draft Validation
+
+The `-00` RFCXML source was checked on 2026-10-06 with `xml2rfc` 3.34.1.  Text,
+HTML, expanded XML, and prepped XML all rendered without warnings.  The
+official IETF Author Tools validator reported no errors, formatting warnings,
+bare Unicode, non-ASCII text, or submission-check nits.  Generated renderings
+are build artifacts and are not committed.
+
+Before submission, update the document date and run:
+
+```sh
+xml2rfc draft-dowdeswell-kitten-gss-sshkey-00.xml \
+  --text --html --expand --preptool --warn-bare-unicode
+```
+
+Then upload the RFCXML source to <https://author-tools.ietf.org/> for the
+current service-side validation and to <https://datatracker.ietf.org/submit/>
+for submission.  A first-submission check may note that it cannot determine
+the draft's previous submission date; that warning is expected for `-00`.
+
 ## Assignment Checklist
 
 After IANA records the value:

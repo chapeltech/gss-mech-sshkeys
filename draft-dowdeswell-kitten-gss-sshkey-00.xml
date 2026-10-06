@@ -18,7 +18,7 @@
         <email>elric@imrryr.org</email>
       </address>
     </author>
-    <date year="2026" month="August" day="20"/>
+    <date year="2026" month="October" day="6"/>
     <area>Security</area>
     <workgroup>Kitten Working Group</workgroup>
     <keyword>GSS-API</keyword>
@@ -84,8 +84,7 @@
       <name>Mechanism Identity</name>
       <t>
         IANA is requested to assign the permanent GSS-SSHKEY mechanism OID
-        from the iso.org.dod.internet.security.mechanisms arc as described in
-        <xref target="iana"/>:
+        from the 1.3.6.1.5.5 OID arc as described in <xref target="iana"/>:
       </t>
       <sourcecode type="asn.1"><![CDATA[
 sshkey OBJECT IDENTIFIER ::=
@@ -450,12 +449,17 @@ user-signature-blob = 040506
 ]]></sourcecode>
       <t>
         DER(SshKeyUserAuth), the handshake transcript hash, and SHA-256 of the
-        complete user signature input are, respectively:
+        complete user signature input are shown below.  Whitespace in a
+        displayed hexadecimal value is not part of that value.
       </t>
       <sourcecode type="text"><![CDATA[
-302c8005616c696365810b7373682d65643235353139820400010203830b7373682d656432353531398403040506
-5c85ea298b49f648864af914d4288b3e1c36047ffafc8c8b48d5076d401b1cd3
-f33be51710e22ab7abf383c87f5ca999f9f104d5a85267d3b67ed3057d4450ff
+DER(SshKeyUserAuth) =
+  302c8005616c696365810b7373682d65643235353139820400010203830b7373
+  682d656432353531398403040506
+handshake-transcript-hash =
+  5c85ea298b49f648864af914d4288b3e1c36047ffafc8c8b48d5076d401b1cd3
+user-signature-input-hash =
+  f33be51710e22ab7abf383c87f5ca999f9f104d5a85267d3b67ed3057d4450ff
 ]]></sourcecode>
     </section>
 
@@ -642,8 +646,7 @@ f33be51710e22ab7abf383c87f5ca999f9f104d5a85267d3b67ed3057d4450ff
       <name>IANA Considerations</name>
       <t>
         IANA is requested to assign one new entry from the "SMI Security for
-        Mechanism Codes" registry under
-        iso.org.dod.internet.security.mechanisms (1.3.6.1.5.5):
+        Mechanism Codes" registry under the 1.3.6.1.5.5 OID arc:
       </t>
       <sourcecode type="text"><![CDATA[
 Value:       TBD1
@@ -734,74 +737,74 @@ SSHKEY DEFINITIONS ::=
 BEGIN
 
 SshKeyCtx ::= SEQUENCE {
-	  user	[0] OCTET STRING	OPTIONAL
-	, key	[1] OCTET STRING	OPTIONAL
-	, h	[2] OCTET STRING	OPTIONAL
+    user  [0] OCTET STRING  OPTIONAL
+  , key   [1] OCTET STRING  OPTIONAL
+  , h     [2] OCTET STRING  OPTIONAL
 }
 
 EncCtx ::= SEQUENCE {
-	  encPart	[0] OCTET STRING
+    encPart  [0] OCTET STRING
 }
 
 SshKeyUserAuth ::= SEQUENCE {
-	  username	[0] OCTET STRING
-	, keytype	[1] OCTET STRING
-	, key		[2] OCTET STRING
-	, sigtype	[3] OCTET STRING
-	, sig		[4] OCTET STRING
+    username  [0] OCTET STRING
+  , keytype   [1] OCTET STRING
+  , key       [2] OCTET STRING
+  , sigtype   [3] OCTET STRING
+  , sig       [4] OCTET STRING
 }
 
 EncSshKeyUserAuth ::= OCTET STRING
 
 SshKeyHostAuth ::= SEQUENCE {
-	  keytype	[0] OCTET STRING
-	, key		[1] OCTET STRING
-	, sigtype	[2] OCTET STRING
-	, sig		[3] OCTET STRING
+    keytype  [0] OCTET STRING
+  , key      [1] OCTET STRING
+  , sigtype  [2] OCTET STRING
+  , sig      [3] OCTET STRING
 }
 
 SshKeyKEX ::= SEQUENCE {
-	  kextypes	[0] OCTET STRING
-	, enctypes	[1] OCTET STRING
-	, sigtypes	[2] OCTET STRING
-	, kextype	[3] OCTET STRING	OPTIONAL
-	, pk		[4] OCTET STRING	OPTIONAL
-	, enctype	[5] OCTET STRING	OPTIONAL
-	, nonce		[6] OCTET STRING	OPTIONAL
-	, acceptorName	[7] OCTET STRING	OPTIONAL
+    kextypes     [0] OCTET STRING
+  , enctypes     [1] OCTET STRING
+  , sigtypes     [2] OCTET STRING
+  , kextype      [3] OCTET STRING  OPTIONAL
+  , pk           [4] OCTET STRING  OPTIONAL
+  , enctype      [5] OCTET STRING  OPTIONAL
+  , nonce        [6] OCTET STRING  OPTIONAL
+  , acceptorName [7] OCTET STRING  OPTIONAL
 }
 
 SshKeyFinished ::= SEQUENCE {
-	  mac		[0] OCTET STRING
+    mac  [0] OCTET STRING
 }
 
 SshKeyServerContext ::= SEQUENCE {
-	  initiatorPk	[0] OCTET STRING	OPTIONAL
-	, acceptorPk	[1] OCTET STRING
-	, sessionKey	[2] OCTET STRING	OPTIONAL
-	, initiatorSigtypes [3] OCTET STRING	OPTIONAL
-	, acceptorSigtypes [4] OCTET STRING
-	, acceptorSk	[5] OCTET STRING	OPTIONAL
-	, initiatorNonce [6] OCTET STRING	OPTIONAL
-	, acceptorNonce [7] OCTET STRING
-	, acceptorName	[8] OCTET STRING
-	, issuedAt	[9] INTEGER
+    initiatorPk       [0] OCTET STRING  OPTIONAL
+  , acceptorPk        [1] OCTET STRING
+  , sessionKey        [2] OCTET STRING  OPTIONAL
+  , initiatorSigtypes [3] OCTET STRING  OPTIONAL
+  , acceptorSigtypes  [4] OCTET STRING
+  , acceptorSk        [5] OCTET STRING  OPTIONAL
+  , initiatorNonce    [6] OCTET STRING  OPTIONAL
+  , acceptorNonce     [7] OCTET STRING
+  , acceptorName      [8] OCTET STRING
+  , issuedAt          [9] INTEGER
 }
 
 SshKeyStatus ::= INTEGER {
-	  SSH-KEY-COMPLETE		(1)
-	, SSH-KEY-CONTINUE-NEEDED	(2)
-	, SSH-KEY-FAILURE		(3)
+    SSH-KEY-COMPLETE        (1)
+  , SSH-KEY-CONTINUE-NEEDED (2)
+  , SSH-KEY-FAILURE         (3)
 }
 
 SshKeyToken ::= SEQUENCE {
-	  status	[0] SshKeyStatus
-	, kex		[1] SshKeyKEX		OPTIONAL
-	, hostauth	[2] SshKeyHostAuth	OPTIONAL
-	, encuserauth	[3] EncSshKeyUserAuth	OPTIONAL
-	, cctx		[4] EncCtx		OPTIONAL
-	, sctx		[5] EncCtx		OPTIONAL
-	, finished	[6] SshKeyFinished	OPTIONAL
+    status      [0] SshKeyStatus
+  , kex         [1] SshKeyKEX          OPTIONAL
+  , hostauth    [2] SshKeyHostAuth     OPTIONAL
+  , encuserauth [3] EncSshKeyUserAuth  OPTIONAL
+  , cctx        [4] EncCtx             OPTIONAL
+  , sctx        [5] EncCtx             OPTIONAL
+  , finished    [6] SshKeyFinished     OPTIONAL
 }
 
 END

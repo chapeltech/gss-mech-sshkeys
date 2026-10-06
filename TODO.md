@@ -242,12 +242,21 @@ with a future assigned OID.
 
 ## Interoperable 0.1 Gate
 
+Status: pending external action 2026-10-06.
+
 Obtain a legitimate permanent GSS-API mechanism OID.  Submit the
 Internet-Draft to the Kitten working group and obtain IESG Approval for its
 `TBD1` request in the IANA "SMI Security for Mechanism Codes" registry.  After
 assignment, replace the experimental OID consistently in the implementation,
 protocol specification, integration adapters, tests, installer, and
 documentation.
+
+The `-00` RFCXML source passes `xml2rfc` 3.34.1 validation and rendering with
+no warnings.  The official IETF Author Tools service reports no errors,
+formatting warnings, bare Unicode, non-ASCII text, or submission-check nits.
+The remaining work requires submission by the author, Kitten working-group
+review, IESG approval, and the resulting IANA assignment; the project cannot
+assign the registry value locally.
 
 ## Working Rules
 
